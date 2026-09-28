@@ -42,6 +42,17 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
         payload["reply_markup"] = reply_markup
     return tg_api_request("sendMessage", payload)
 
+def edit_message_text(chat_id, message_id, text, reply_markup=None, parse_mode="Markdown"):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg_api_request("editMessageText", payload)
+
 def answer_callback_query(callback_query_id, text=None):
     payload = {"callback_query_id": callback_query_id}
     if text:
@@ -64,6 +75,27 @@ def get_latest_commit():
     except Exception as e:
         print(f"Ошибка GitHub API: {e}")
     return None, None, None, None
+
+
+# ==================== ВЕРСТКА ГЛАВНОГО МЕНЮ ====================
+def get_main_menu():
+    text = (
+        f"👋 **Привет! Я твой автономный GitHub-помощник!**\n\n"
+        f"Я слежу за репозиторием `{REPO_OWNER}/{REPO_NAME}` и сразу присылаю "
+        f"уведомление, когда появляется новый коммит.\n\n"
+        f"Выбери действие на кнопках ниже 👇"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "📊 Последний коммит", "callback_data": "check_commit"}],
+            [
+                {"text": "📁 О репозитории", "callback_data": "about_repo"},
+                {"text": "🟢 Статус бота", "callback_data": "bot_status"}
+            ],
+            [{"text": "🌐 Открыть GitHub", "url": f"https://github.com/{REPO_OWNER}/{REPO_NAME}"}]
+        ]
+    }
+    return text, keyboard
 
 
 # ==================== МОНИТОРИНГ ГИТХАБА (ПОТОК 1) ====================
@@ -101,45 +133,51 @@ def handle_update(update):
         text = msg.get("text", "")
         
         if text == "/start":
-            welcome_text = (
-                f"👋 **Привет! Я твой автономный GitHub-помощник!**\n\n"
-                f"Я слежу за репозиторием `{REPO_OWNER}/{REPO_NAME}` и сразу присылаю "
-                f"уведомление, когда появляется новый коммит.\n\n"
-                f"Выбери действие на кнопках ниже 👇"
-            )
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "📊 Последний коммит", "callback_data": "check_commit"}],
-                    [
-                        {"text": "📁 О репозитории", "callback_data": "about_repo"},
-                        {"text": "🟢 Статус бота", "callback_data": "bot_status"}
-                    ],
-                    [{"text": "🌐 Открыть GitHub", "url": f"https://github.com/{REPO_OWNER}/{REPO_NAME}"}]
-                ]
-            }
+            welcome_text, keyboard = get_main_menu()
             send_message(chat_id, welcome_text, reply_markup=keyboard)
 
     elif "callback_query" in update:
         cb = update["callback_query"]
         cb_id = cb["id"]
         chat_id = cb["message"]["chat"]["id"]
+        msg_id = cb["message"]["message_id"]
         data = cb.get("data")
         
-        if data == "check_commit":
-            answer_callback_query(cb_id, "Получаю данные с GitHub...")
+        back_keyboard = {
+            "inline_keyboard": [
+                [{"text": "🔙 Назад в меню", "callback_data": "main_menu"}]
+            ]
+        }
+        
+        # Возврат в главное меню
+        if data == "main_menu":
+            answer_callback_query(cb_id)
+            welcome_text, keyboard = get_main_menu()
+            edit_message_text(chat_id, msg_id, welcome_text, reply_markup=keyboard)
+
+        # Просмотр последнего коммита
+        elif data == "check_commit":
+            answer_callback_query(cb_id, "Загружаю данные...")
             sha, msg, url, author = get_latest_commit()
             if sha:
                 reply = (
-                    f"📌 **Последний коммит:**\n\n"
+                    f"📌 **Последний коммит в {REPO_NAME}:**\n\n"
                     f"🔑 `SHA:` `{sha[:7]}`\n"
                     f"👤 `Автор:` {author}\n"
                     f"📝 `Сообщение:` {msg}"
                 )
-                kb = {"inline_keyboard": [[{"text": "🔗 Перейти к коммиту", "url": url}]]}
-                send_message(chat_id, reply, reply_markup=kb)
+                kb = {
+                    "inline_keyboard": [
+                        [{"text": "🔗 Перейти к коммиту", "url": url}],
+                        [{"text": "🔙 Назад в меню", "callback_data": "main_menu"}]
+                    ]
+                }
+                edit_message_text(chat_id, msg_id, reply, reply_markup=kb)
             else:
-                send_message(chat_id, "⚠️ Не удалось получить коммит с GitHub.")
+                reply = "⚠️ **Не удалось получить данные.**\nВозможно, в репозитории пока нет коммитов."
+                edit_message_text(chat_id, msg_id, reply, reply_markup=back_keyboard)
                 
+        # Информация о репозитории
         elif data == "about_repo":
             answer_callback_query(cb_id)
             info = (
@@ -148,17 +186,18 @@ def handle_update(update):
                 f"• **Название:** `{REPO_NAME}`\n"
                 f"• **Интервал проверки:** каждые {CHECK_INTERVAL // 60} мин."
             )
-            send_message(chat_id, info)
+            edit_message_text(chat_id, msg_id, info, reply_markup=back_keyboard)
             
+        # Статус бота
         elif data == "bot_status":
             answer_callback_query(cb_id)
             status = (
                 "🟢 **Бот работает идеально!**\n\n"
-                "• **Сервер:** Render.com (24/7)\n"
-                "• **Режим:** Автономный (Мониторинг + Интерактив)\n"
+                "• **Хостинг:** Render.com (24/7)\n"
+                "• **Режим:** Интерактивное меню + автомониторинг\n"
                 "• **Язык:** Python 3"
             )
-            send_message(chat_id, status)
+            edit_message_text(chat_id, msg_id, status, reply_markup=back_keyboard)
 
 
 def telegram_polling_thread():
