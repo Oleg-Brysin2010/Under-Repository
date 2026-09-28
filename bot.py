@@ -1,60 +1,67 @@
+import html
 import json
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ==================== НАСТРОЙКИ (ИЗ ОКРУЖЕНИЯ RENDER) ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-CHAT_ID = os.environ.get("CHAT_ID", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")  # куда слать уведомления
+PORT = int(os.environ.get("PORT", "10000"))  # Render сам задаёт PORT
 
-# Репозиторий для отслеживания
-REPO_OWNER = "akanchik-id"
-REPO_NAME = "akanchik-id.github.io"
-CHECK_INTERVAL = 300  # Проверка каждые 5 минут
+REPO_OWNER = os.environ.get("REPO_OWNER", "akanchik-id")
+REPO_NAME = os.environ.get("REPO_NAME", "akanchik-id.github.io")
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # секунд
+
+START_TIME = time.time()
+STATE = {"last_check": None, "last_error": None}
 
 
-# ==================== ФУНКЦИИ TELEGRAM API ====================
-def tg_api_request(method, payload=None):
+# ==================== TELEGRAM API ====================
+def tg_api_request(method, payload=None, timeout=15):
     if not BOT_TOKEN:
-        print("❌ Ошибка: BOT_TOKEN не установлен в Environment Variables!")
+        print("❌ BOT_TOKEN не установлен!")
         return None
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    data = None
-    headers = {}
-
-    if payload:
-        data = json.dumps(payload).encode('utf-8')
-        headers['Content-Type'] = 'application/json'
-
+    data = json.dumps(payload).encode() if payload else None
+    headers = {"Content-Type": "application/json"} if payload else {}
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            if resp.status == 200:
-                return json.loads(resp.read().decode('utf-8'))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        # "message is not modified" — безобидная ошибка, не шумим
+        if "not modified" not in body:
+            print(f"Ошибка TG API ({method}): {e.code} {body[:200]}")
     except Exception as e:
         print(f"Ошибка TG API ({method}): {e}")
     return None
 
 
-def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+def send_message(chat_id, text, reply_markup=None):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     if reply_markup:
         payload["reply_markup"] = reply_markup
     return tg_api_request("sendMessage", payload)
 
 
-def edit_message_text(
-    chat_id, message_id, text, reply_markup=None, parse_mode="Markdown"
-):
+def edit_message_text(chat_id, message_id, text, reply_markup=None):
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
         "text": text,
-        "parse_mode": parse_mode,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -68,63 +75,116 @@ def answer_callback_query(callback_query_id, text=None):
     tg_api_request("answerCallbackQuery", payload)
 
 
-# ==================== ФУНКЦИИ GITHUB API ====================
-def get_latest_commit():
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/commits"
+def setup_bot_commands():
+    tg_api_request(
+        "setMyCommands",
+        {
+            "commands": [
+                {"command": "start", "description": "Главное меню"},
+                {"command": "last", "description": "Последний коммит"},
+                {"command": "commits", "description": "Последние 5 коммитов"},
+            ]
+        },
+    )
+
+
+# ==================== GITHUB API ====================
+def gh_get(path, etag=None):
+    """Возвращает (status, data, etag, error). 304 = ничего не изменилось."""
+    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}{path}"
     headers = {
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        ),
-        'Accept': 'application/vnd.github.v3+json',
+        "User-Agent": "github-telegram-monitor",
+        "Accept": "application/vnd.github+json",
     }
     if GITHUB_TOKEN:
-        headers['Authorization'] = f'token {GITHUB_TOKEN}'
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    if etag:
+        headers["If-None-Match"] = etag
 
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            if response.status == 200:
-                data = json.loads(response.read().decode('utf-8'))
-                if data and isinstance(data, list) and len(data) > 0:
-                    commit = data[0]
-                    author = commit["commit"]["author"]["name"]
-                    return (
-                        commit["sha"],
-                        commit["commit"]["message"],
-                        commit["html_url"],
-                        author,
-                        None,
-                    )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            return resp.status, data, resp.headers.get("ETag"), None
     except urllib.error.HTTPError as e:
-        err_msg = f"HTTP {e.code}: {e.reason}"
-        if e.code == 403:
-            err_msg += " (Лимит запросов GitHub API)"
+        if e.code == 304:
+            return 304, None, etag, None
+        msg = f"HTTP {e.code}: {e.reason}"
+        if e.code in (403, 429):
+            msg += " (лимит запросов GitHub API)"
         elif e.code == 404:
-            err_msg += " (Репозиторий не найден)"
-        print(f"Ошибка GitHub API: {err_msg}")
-        return None, None, None, None, err_msg
+            msg += " (репозиторий не найден)"
+        return e.code, None, etag, msg
     except Exception as e:
-        print(f"Ошибка подключения к GitHub: {e}")
-        return None, None, None, None, str(e)
-
-    return None, None, None, None, "Пустой ответ от GitHub"
+        return 0, None, etag, str(e)
 
 
-# ==================== ВЕРСТКА ГЛАВНОГО МЕНЮ ====================
+def get_commits(limit=5):
+    status, data, _, err = gh_get(f"/commits?per_page={limit}")
+    if status == 200 and isinstance(data, list) and data:
+        return data, None
+    return None, err or "Пустой ответ от GitHub"
+
+
+def get_repo_info():
+    status, data, _, err = gh_get("")
+    if status == 200 and isinstance(data, dict):
+        return data, None
+    return None, err or "Пустой ответ от GitHub"
+
+
+# ==================== ФОРМАТИРОВАНИЕ ====================
+def esc(s):
+    return html.escape(str(s), quote=False)
+
+
+def fmt_date(iso):
+    return iso[:16].replace("T", " ") + " UTC" if iso else "?"
+
+
+def fmt_commit(c, full=True):
+    info = c["commit"]
+    lines = info["message"].strip().split("\n")
+    title = lines[0][:200]
+    body = "\n".join(lines[1:]).strip()[:300]
+    text = (
+        f"🔑 <code>{c['sha'][:7]}</code>\n"
+        f"👤 <b>{esc(info['author']['name'])}</b> · "
+        f"{fmt_date(info['author']['date'])}\n"
+        f"📝 {esc(title)}"
+    )
+    if full and body:
+        text += f"\n<i>{esc(body)}</i>"
+    return text
+
+
+def fmt_uptime(seconds):
+    d, r = divmod(int(seconds), 86400)
+    h, r = divmod(r, 3600)
+    m, _ = divmod(r, 60)
+    return f"{d}д {h}ч {m}м" if d else f"{h}ч {m}м"
+
+
+# ==================== КЛАВИАТУРЫ ====================
+BACK_KB = {
+    "inline_keyboard": [
+        [{"text": "🔙 Назад в меню", "callback_data": "main_menu"}]
+    ]
+}
+
+
 def get_main_menu():
     text = (
-        f"👋 **Привет! Я твой автономный GitHub-помощник!**\n\n"
-        f"Я слежу за репозиторием `{REPO_OWNER}/{REPO_NAME}` и сразу присылаю "
-        f"уведомление, когда появляется новый коммит.\n\n"
-        f"Выбери действие на кнопках ниже 👇"
+        "👋 <b>Привет! Я твой автономный GitHub-помощник!</b>\n\n"
+        f"Слежу за репозиторием <code>{esc(REPO_OWNER)}/{esc(REPO_NAME)}</code> "
+        "и сразу присылаю уведомление о новых коммитах.\n\n"
+        "Выбери действие 👇"
     )
     keyboard = {
         "inline_keyboard": [
             [
-                {
-                    "text": "📊 Последний коммит",
-                    "callback_data": "check_commit",
-                }
+                {"text": "📊 Последний коммит", "callback_data": "check_commit"},
+                {"text": "📜 Последние 5", "callback_data": "list_commits"},
             ],
             [
                 {"text": "📁 О репозитории", "callback_data": "about_repo"},
@@ -141,44 +201,132 @@ def get_main_menu():
     return text, keyboard
 
 
+# ==================== ЭКРАНЫ (общие для команд и кнопок) ====================
+def screen_last_commit():
+    commits, err = get_commits(1)
+    if not commits:
+        return (
+            f"⚠️ <b>Не удалось получить данные с GitHub.</b>\n\n"
+            f"🔍 <b>Причина:</b> <code>{esc(err)}</code>",
+            BACK_KB,
+        )
+    c = commits[0]
+    kb = {
+        "inline_keyboard": [
+            [{"text": "🔗 Перейти к коммиту", "url": c["html_url"]}],
+            [{"text": "🔙 Назад в меню", "callback_data": "main_menu"}],
+        ]
+    }
+    return f"📌 <b>Последний коммит в {esc(REPO_NAME)}:</b>\n\n{fmt_commit(c)}", kb
+
+
+def screen_commit_list():
+    commits, err = get_commits(5)
+    if not commits:
+        return f"⚠️ Не удалось получить коммиты: <code>{esc(err)}</code>", BACK_KB
+    blocks = [fmt_commit(c, full=False) for c in commits]
+    text = "📜 <b>Последние коммиты:</b>\n\n" + "\n\n".join(blocks)
+    return text, BACK_KB
+
+
+def screen_repo_info():
+    repo, err = get_repo_info()
+    if not repo:
+        return f"⚠️ Не удалось получить данные: <code>{esc(err)}</code>", BACK_KB
+    desc = repo.get("description") or "—"
+    text = (
+        "📁 <b>Отслеживаемый репозиторий</b>\n\n"
+        f"• <b>Название:</b> <code>{esc(repo['full_name'])}</code>\n"
+        f"• <b>Описание:</b> {esc(desc)}\n"
+        f"• <b>Язык:</b> {esc(repo.get('language') or '—')}\n"
+        f"• ⭐ {repo['stargazers_count']} · 🍴 {repo['forks_count']} · "
+        f"🐞 {repo['open_issues_count']}\n"
+        f"• <b>Последний push:</b> {fmt_date(repo.get('pushed_at'))}\n"
+        f"• <b>Проверка:</b> каждые {CHECK_INTERVAL // 60} мин."
+    )
+    return text, BACK_KB
+
+
+def screen_status():
+    last = STATE["last_check"]
+    last_txt = fmt_uptime(time.time() - last) + " назад" if last else "ещё не было"
+    err = STATE["last_error"]
+    icon = "🟢" if not err else "🟡"
+    text = (
+        f"{icon} <b>Бот работает</b>\n\n"
+        f"• <b>Аптайм:</b> {fmt_uptime(time.time() - START_TIME)}\n"
+        f"• <b>Последняя проверка GitHub:</b> {last_txt}\n"
+        f"• <b>Уведомления в чат:</b> {'настроены ✅' if CHAT_ID else 'CHAT_ID не задан ❌'}\n"
+        f"• <b>GitHub токен:</b> {'есть ✅' if GITHUB_TOKEN else 'нет (лимит 60 запросов/час)'}"
+    )
+    if err:
+        text += f"\n• <b>Последняя ошибка:</b> <code>{esc(err)}</code>"
+    return text, BACK_KB
+
+
 # ==================== МОНИТОРИНГ ГИТХАБА (ПОТОК 1) ====================
+def notify_commit(c):
+    text = f"🚀 <b>Новый коммит в {esc(REPO_OWNER)}/{esc(REPO_NAME)}!</b>\n\n{fmt_commit(c)}"
+    kb = {
+        "inline_keyboard": [
+            [{"text": "🔗 Посмотреть на GitHub", "url": c["html_url"]}]
+        ]
+    }
+    send_message(CHAT_ID, text, reply_markup=kb)
+
+
 def github_monitor_thread():
     print("🚀 [GitHub Monitor] Запущен мониторинг коммитов...")
-    last_sha, _, _, _, _ = get_latest_commit()
+    if not CHAT_ID:
+        print("⚠️ CHAT_ID не задан — уведомления отправляться не будут!")
 
-    if last_sha:
-        print(f"📌 [GitHub Monitor] Текущий хэш: {last_sha[:7]}")
-
+    last_sha, etag = None, None
     while True:
+        try:
+            # ETag: если ничего не изменилось, GitHub отвечает 304
+            # и этот запрос не расходует лимит.
+            status, data, new_etag, err = gh_get("/commits?per_page=10", etag)
+            STATE["last_check"] = time.time()
+            STATE["last_error"] = err
+
+            if status == 200 and data:
+                etag = new_etag
+                shas = [c["sha"] for c in data]
+                if last_sha is None:
+                    last_sha = shas[0]
+                    print(f"📌 Текущий хэш: {last_sha[:7]}")
+                elif shas[0] != last_sha:
+                    # Берём ВСЕ новые коммиты, а не только самый свежий
+                    new = data[: shas.index(last_sha)] if last_sha in shas else data
+                    last_sha = shas[0]
+                    if CHAT_ID:
+                        for c in reversed(new[:5]):  # от старого к новому
+                            notify_commit(c)
+                        print(f"✅ Отправлено уведомлений: {len(new[:5])}")
+            elif err:
+                print(f"Ошибка GitHub API: {err}")
+        except Exception as e:
+            STATE["last_error"] = str(e)
+            print(f"Ошибка мониторинга: {e}")
         time.sleep(CHECK_INTERVAL)
-        sha, msg, url, author, err = get_latest_commit()
-        if sha and sha != last_sha:
-            last_sha = sha
-            text = (
-                f"🚀 **Новый коммит в {REPO_OWNER}/{REPO_NAME}!**\n\n"
-                f"👤 **Автор:** {author}\n"
-                f"📝 **Сообщение:** {msg}"
-            )
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "🔗 Посмотреть на GitHub", "url": url}]
-                ]
-            }
-            target_chat = CHAT_ID if CHAT_ID else "5399489280"
-            send_message(target_chat, text, reply_markup=keyboard)
-            print(f"✅ Уведомление отправлено: {sha[:7]}")
 
 
-# ==================== ОБРАБОТКА КОМАНД И КНОПОК (ПОТОК 2) ====================
+# ==================== КОМАНДЫ И КНОПКИ (ПОТОК 2) ====================
 def handle_update(update):
     if "message" in update:
         msg = update["message"]
         chat_id = msg["chat"]["id"]
-        text = msg.get("text", "")
+        text = (msg.get("text") or "").split("@")[0].strip()
 
         if text == "/start":
-            welcome_text, keyboard = get_main_menu()
-            send_message(chat_id, welcome_text, reply_markup=keyboard)
+            t, kb = get_main_menu()
+            send_message(chat_id, t, reply_markup=kb)
+        elif text == "/last":
+            t, kb = screen_last_commit()
+            send_message(chat_id, t, reply_markup=kb)
+        elif text == "/commits":
+            t, kb = screen_commit_list()
+            send_message(chat_id, t, reply_markup=kb)
 
     elif "callback_query" in update:
         cb = update["callback_query"]
@@ -187,80 +335,34 @@ def handle_update(update):
         msg_id = cb["message"]["message_id"]
         data = cb.get("data")
 
-        back_keyboard = {
-            "inline_keyboard": [
-                [{"text": "🔙 Назад в меню", "callback_data": "main_menu"}]
-            ]
+        screens = {
+            "main_menu": get_main_menu,
+            "check_commit": screen_last_commit,
+            "list_commits": screen_commit_list,
+            "about_repo": screen_repo_info,
+            "bot_status": screen_status,
         }
-
-        if data == "main_menu":
-            answer_callback_query(cb_id)
-            welcome_text, keyboard = get_main_menu()
-            edit_message_text(
-                chat_id, msg_id, welcome_text, reply_markup=keyboard
-            )
-
-        elif data == "check_commit":
-            answer_callback_query(cb_id, "Загружаю данные...")
-            sha, msg, url, author, err = get_latest_commit()
-            if sha:
-                reply = (
-                    f"📌 **Последний коммит в {REPO_NAME}:**\n\n"
-                    f"🔑 `SHA:` `{sha[:7]}`\n"
-                    f"👤 `Автор:` {author}\n"
-                    f"📝 `Сообщение:` {msg}"
-                )
-                kb = {
-                    "inline_keyboard": [
-                        [{"text": "🔗 Перейти к коммиту", "url": url}],
-                        [
-                            {
-                                "text": "🔙 Назад в меню",
-                                "callback_data": "main_menu",
-                            }
-                        ],
-                    ]
-                }
-                edit_message_text(chat_id, msg_id, reply, reply_markup=kb)
-            else:
-                reply = (
-                    f"⚠️ **Не удалось получить данные с GitHub.**\n\n"
-                    f"🔍 **Причина:** `{err}`"
-                )
-                edit_message_text(
-                    chat_id, msg_id, reply, reply_markup=back_keyboard
-                )
-
-        elif data == "about_repo":
-            answer_callback_query(cb_id)
-            info = (
-                f"📁 **Отслеживаемый репозиторий:**\n\n"
-                f"• **Владелец:** `{REPO_OWNER}`\n"
-                f"• **Название:** `{REPO_NAME}`\n"
-                f"• **Интервал проверки:** каждые {CHECK_INTERVAL // 60} мин."
-            )
-            edit_message_text(
-                chat_id, msg_id, info, reply_markup=back_keyboard
-            )
-
-        elif data == "bot_status":
-            answer_callback_query(cb_id)
-            status = (
-                "🟢 **Бот работает идеально!**\n\n"
-                "• **Хостинг:** Render.com (24/7)\n"
-                "• **Режим:** Интерактивное меню + автомониторинг\n"
-                "• **Язык:** Python 3"
-            )
-            edit_message_text(
-                chat_id, msg_id, status, reply_markup=back_keyboard
-            )
+        answer_callback_query(cb_id, "Загружаю..." if data in ("check_commit", "list_commits", "about_repo") else None)
+        if data in screens:
+            t, kb = screens[data]()
+            edit_message_text(chat_id, msg_id, t, reply_markup=kb)
 
 
 def telegram_polling_thread():
-    print("💬 [Telegram Polling] Запущена обработка /start и кнопок...")
+    print("💬 [Telegram Polling] Запущена обработка команд и кнопок...")
+    setup_bot_commands()
     offset = 0
     while True:
-        res = tg_api_request("getUpdates", {"offset": offset, "timeout": 20})
+        # Таймаут HTTP должен быть БОЛЬШЕ, чем long-polling timeout Telegram
+        res = tg_api_request(
+            "getUpdates",
+            {
+                "offset": offset,
+                "timeout": 30,
+                "allowed_updates": ["message", "callback_query"],
+            },
+            timeout=40,
+        )
         if res and res.get("ok"):
             for update in res.get("result", []):
                 offset = update["update_id"] + 1
@@ -268,11 +370,33 @@ def telegram_polling_thread():
                     handle_update(update)
                 except Exception as e:
                     print(f"Ошибка обработки обновления: {e}")
-        time.sleep(1)
+        else:
+            time.sleep(5)  # пауза только при ошибке, а не после каждого цикла
+
+
+# ==================== HEALTH-СЕРВЕР ДЛЯ RENDER ====================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    do_HEAD = do_GET
+
+    def log_message(self, *args):
+        pass  # не засоряем логи
+
+
+def health_server_thread():
+    # Render Web Service требует открытый порт, иначе деплой считается неудачным.
+    # Этот же адрес можно пинговать (UptimeRobot), чтобы бесплатный
+    # тариф не "засыпал".
+    HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
 
 # ==================== ТОЧКА ВХОДА ====================
 if __name__ == "__main__":
-    gh_thread = threading.Thread(target=github_monitor_thread, daemon=True)
-    gh_thread.start()
+    threading.Thread(target=health_server_thread, daemon=True).start()
+    threading.Thread(target=github_monitor_thread, daemon=True).start()
     telegram_polling_thread()
