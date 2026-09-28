@@ -8,8 +8,8 @@ BOT_TOKEN = "8987351216:AAFuBiem5l3Ef5FKWJCJFBVZsV4aJX2UcbU"
 CHAT_ID = "5399489280"
 
 # Репозиторий для отслеживания
-REPO_OWNER = "Oleg-Brysin2010"
-REPO_NAME = "Under-Repository"
+REPO_OWNER = "akanchik-id"
+REPO_NAME = "akanchik-id.github.io"
 CHECK_INTERVAL = 300  # Проверка каждые 5 минут (300 сек)
 
 
