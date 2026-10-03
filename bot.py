@@ -1,3 +1,4 @@
+import base64
 import html
 import json
 import os
@@ -7,14 +8,15 @@ import urllib.error
 import urllib.request
 
 # ==================== НАСТРОЙКИ ====================
-# Переменные берутся из окружения системы (или задаются в кавычках ниже по умолчанию)
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8987351216:AAFuBiem5l3Ef5FKWJCJFBVZsV4aJX2UcbU")
+# Все значения берутся из окружения сервера (файл /root/bot/.env)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "5399489280")  # куда слать уведомления
 
 REPO_OWNER = os.environ.get("REPO_OWNER", "akanchik-id")
 REPO_NAME = os.environ.get("REPO_NAME", "akanchik-id.github.io")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # интервал проверки (секунд)
+WATCH_FILE = os.environ.get("WATCH_FILE", "index.html")  # файл, который присылаем при изменении
 
 START_TIME = time.time()
 STATE = {"last_check": None, "last_error": None}
@@ -81,6 +83,7 @@ def setup_bot_commands():
                 {"command": "start", "description": "Главное меню"},
                 {"command": "last", "description": "Последний коммит"},
                 {"command": "commits", "description": "Последние 5 коммитов"},
+                {"command": "file", "description": f"Прислать {WATCH_FILE}"},
             ]
         },
     )
@@ -176,6 +179,8 @@ def get_main_menu():
         "👋 <b>Привет! Я твой автономный GitHub-помощник!</b>\n\n"
         f"Слежу за репозиторием <code>{esc(REPO_OWNER)}/{esc(REPO_NAME)}</code> "
         "и сразу присылаю уведомление о новых коммитах.\n\n"
+        f"📄 Если изменится <code>{esc(WATCH_FILE)}</code>, пришлю его файлом. "
+        "Получить прямо сейчас: /file\n\n"
         "Выбери действие 👇"
     )
     keyboard = {
@@ -306,6 +311,82 @@ def github_monitor_thread():
         time.sleep(CHECK_INTERVAL)
 
 
+# ==================== СЛЕЖЕНИЕ ЗА ФАЙЛОМ (ПОТОК 3) ====================
+def send_document(chat_id, filename, content, caption=None):
+    """Отправляет файл в Telegram (multipart/form-data, без сторонних библиотек)."""
+    boundary = "----tgbot" + str(int(time.time() * 1000))
+
+    def field(name, value):
+        return (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+        ).encode()
+
+    body = field("chat_id", chat_id)
+    if caption:
+        body += field("caption", caption) + field("parse_mode", "HTML")
+    body += (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; '
+        f'filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'
+    ).encode()
+    body += content + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"Ошибка sendDocument: {e}")
+        return None
+
+
+def get_file():
+    """Возвращает (sha, байты файла, ошибка)."""
+    status, data, _, err = gh_get(f"/contents/{WATCH_FILE}")
+    if status == 200 and isinstance(data, dict) and "sha" in data:
+        try:
+            if data.get("content"):
+                raw = base64.b64decode(data["content"])
+            else:
+                with urllib.request.urlopen(data["download_url"], timeout=30) as r:
+                    raw = r.read()
+            return data["sha"], raw, None
+        except Exception as e:
+            return None, None, str(e)
+    if status == 404:
+        err = f"файл {WATCH_FILE} не найден в репозитории"
+    return None, None, err or "Пустой ответ от GitHub"
+
+
+def file_monitor_thread():
+    print(f"📄 [File Monitor] Слежу за файлом {WATCH_FILE}...")
+    last_sha = None
+    while True:
+        try:
+            sha, raw, err = get_file()
+            if sha and raw is not None:
+                if last_sha is None:
+                    last_sha = sha
+                    print(f"📌 Текущий sha файла: {sha[:7]}")
+                elif sha != last_sha:
+                    last_sha = sha
+                    if CHAT_ID:
+                        send_document(
+                            CHAT_ID,
+                            WATCH_FILE.split("/")[-1],
+                            raw,
+                            f"📄 <b>{esc(WATCH_FILE)}</b> обновлён",
+                        )
+                        print("✅ Файл отправлен")
+            elif err:
+                print(f"Ошибка слежения за файлом: {err}")
+        except Exception as e:
+            print(f"Ошибка слежения за файлом: {e}")
+        time.sleep(CHECK_INTERVAL)
+
+
 # ==================== КОМАНДЫ И КНОПКИ (ПОТОК 2) ====================
 def handle_update(update):
     if "message" in update:
@@ -322,6 +403,12 @@ def handle_update(update):
         elif text == "/commits":
             t, kb = screen_commit_list()
             send_message(chat_id, t, reply_markup=kb)
+        elif text == "/file":
+            sha, raw, err = get_file()
+            if raw is not None:
+                send_document(chat_id, WATCH_FILE.split("/")[-1], raw)
+            else:
+                send_message(chat_id, f"⚠️ Не удалось получить файл: <code>{esc(err)}</code>")
 
     elif "callback_query" in update:
         cb = update["callback_query"]
@@ -370,6 +457,7 @@ def telegram_polling_thread():
 
 # ==================== ТОЧКА ВХОДА ====================
 if __name__ == "__main__":
-    # Запускаем фоновый мониторинг GitHub и основной цикл Telegram
+    # Фоновые потоки: коммиты и файл, основной цикл — Telegram
     threading.Thread(target=github_monitor_thread, daemon=True).start()
+    threading.Thread(target=file_monitor_thread, daemon=True).start()
     telegram_polling_thread()
