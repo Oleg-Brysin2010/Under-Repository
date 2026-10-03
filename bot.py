@@ -5,17 +5,16 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# ==================== НАСТРОЙКИ (ИЗ ОКРУЖЕНИЯ RENDER) ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# ==================== НАСТРОЙКИ ====================
+# Переменные берутся из окружения системы (или задаются в кавычках ниже по умолчанию)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8987351216:AAFuBiem5l3Ef5FKWJCJFBVZsV4aJX2UcbU")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-CHAT_ID = os.environ.get("CHAT_ID", "")  # куда слать уведомления
-PORT = int(os.environ.get("PORT", "10000"))  # Render сам задаёт PORT
+CHAT_ID = os.environ.get("CHAT_ID", "5399489280")  # куда слать уведомления
 
 REPO_OWNER = os.environ.get("REPO_OWNER", "akanchik-id")
 REPO_NAME = os.environ.get("REPO_NAME", "akanchik-id.github.io")
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # секунд
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # интервал проверки (секунд)
 
 START_TIME = time.time()
 STATE = {"last_check": None, "last_error": None}
@@ -35,7 +34,6 @@ def tg_api_request(method, payload=None, timeout=15):
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="ignore")
-        # "message is not modified" — безобидная ошибка, не шумим
         if "not modified" not in body:
             print(f"Ошибка TG API ({method}): {e.code} {body[:200]}")
     except Exception as e:
@@ -201,7 +199,7 @@ def get_main_menu():
     return text, keyboard
 
 
-# ==================== ЭКРАНЫ (общие для команд и кнопок) ====================
+# ==================== ЭКРАНЫ ====================
 def screen_last_commit():
     commits, err = get_commits(1)
     if not commits:
@@ -283,8 +281,6 @@ def github_monitor_thread():
     last_sha, etag = None, None
     while True:
         try:
-            # ETag: если ничего не изменилось, GitHub отвечает 304
-            # и этот запрос не расходует лимит.
             status, data, new_etag, err = gh_get("/commits?per_page=10", etag)
             STATE["last_check"] = time.time()
             STATE["last_error"] = err
@@ -296,11 +292,10 @@ def github_monitor_thread():
                     last_sha = shas[0]
                     print(f"📌 Текущий хэш: {last_sha[:7]}")
                 elif shas[0] != last_sha:
-                    # Берём ВСЕ новые коммиты, а не только самый свежий
                     new = data[: shas.index(last_sha)] if last_sha in shas else data
                     last_sha = shas[0]
                     if CHAT_ID:
-                        for c in reversed(new[:5]):  # от старого к новому
+                        for c in reversed(new[:5]):
                             notify_commit(c)
                         print(f"✅ Отправлено уведомлений: {len(new[:5])}")
             elif err:
@@ -353,7 +348,6 @@ def telegram_polling_thread():
     setup_bot_commands()
     offset = 0
     while True:
-        # Таймаут HTTP должен быть БОЛЬШЕ, чем long-polling timeout Telegram
         res = tg_api_request(
             "getUpdates",
             {
@@ -371,32 +365,11 @@ def telegram_polling_thread():
                 except Exception as e:
                     print(f"Ошибка обработки обновления: {e}")
         else:
-            time.sleep(5)  # пауза только при ошибке, а не после каждого цикла
-
-
-# ==================== HEALTH-СЕРВЕР ДЛЯ RENDER ====================
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    do_HEAD = do_GET
-
-    def log_message(self, *args):
-        pass  # не засоряем логи
-
-
-def health_server_thread():
-    # Render Web Service требует открытый порт, иначе деплой считается неудачным.
-    # Этот же адрес можно пинговать (UptimeRobot), чтобы бесплатный
-    # тариф не "засыпал".
-    HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
+            time.sleep(5)
 
 
 # ==================== ТОЧКА ВХОДА ====================
 if __name__ == "__main__":
-    threading.Thread(target=health_server_thread, daemon=True).start()
+    # Запускаем фоновый мониторинг GitHub и основной цикл Telegram
     threading.Thread(target=github_monitor_thread, daemon=True).start()
     telegram_polling_thread()
