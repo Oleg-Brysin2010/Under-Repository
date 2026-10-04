@@ -1,31 +1,69 @@
 import base64
 import html
 import json
+import logging
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
+from logging.handlers import RotatingFileHandler
 
 # ==================== НАСТРОЙКИ ====================
 # Все значения берутся из окружения сервера (файл /root/bot/.env)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-CHAT_ID = os.environ.get("CHAT_ID", "5399489280")  # куда слать уведомления
+CHAT_ID = os.environ.get("CHAT_ID", "5399489280")  # куда слать уведомления (и единственный, кому бот отвечает)
 
 REPO_OWNER = os.environ.get("REPO_OWNER", "akanchik-id")
 REPO_NAME = os.environ.get("REPO_NAME", "akanchik-id.github.io")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # интервал проверки (секунд)
 WATCH_FILE = os.environ.get("WATCH_FILE", "index.html")  # файл, который присылаем при изменении
+LOG_FILE = os.environ.get("LOG_FILE", "bot.log")  # файл лога
 
 START_TIME = time.time()
 STATE = {"last_check": None, "last_error": None}
+
+# Что бот "помнит" между проверками
+MONITOR = {"commit_sha": None, "commit_etag": None, "file_sha": None}
+CHECK_LOCK = threading.Lock()  # чтобы ручная и автоматическая проверки не пересекались
+
+
+# ==================== ЛОГИРОВАНИЕ ====================
+def setup_logging():
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    # В файл: до 1 МБ, хранится 3 старых копии
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+
+    # И в консоль (видно в journalctl / screen)
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+
+log = logging.getLogger("bot")
+
+
+# ==================== БЕЗОПАСНОСТЬ ====================
+def is_allowed(chat_id):
+    """Бот отвечает только владельцу. Если CHAT_ID не задан — не отвечает никому."""
+    return bool(CHAT_ID) and str(chat_id) == str(CHAT_ID)
 
 
 # ==================== TELEGRAM API ====================
 def tg_api_request(method, payload=None, timeout=15):
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN не установлен!")
+        log.error("BOT_TOKEN не установлен!")
         return None
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = json.dumps(payload).encode() if payload else None
@@ -37,9 +75,9 @@ def tg_api_request(method, payload=None, timeout=15):
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="ignore")
         if "not modified" not in body:
-            print(f"Ошибка TG API ({method}): {e.code} {body[:200]}")
+            log.error("Ошибка TG API (%s): %s %s", method, e.code, body[:200])
     except Exception as e:
-        print(f"Ошибка TG API ({method}): {e}")
+        log.error("Ошибка TG API (%s): %s", method, e)
     return None
 
 
@@ -83,6 +121,7 @@ def setup_bot_commands():
                 {"command": "start", "description": "Главное меню"},
                 {"command": "last", "description": "Последний коммит"},
                 {"command": "commits", "description": "Последние 5 коммитов"},
+                {"command": "check", "description": "Принудительная проверка GitHub"},
                 {"command": "file", "description": f"Прислать {WATCH_FILE}"},
             ]
         },
@@ -173,6 +212,13 @@ BACK_KB = {
     ]
 }
 
+CHECK_KB = {
+    "inline_keyboard": [
+        [{"text": "🔄 Проверить ещё раз", "callback_data": "force_check"}],
+        [{"text": "🔙 Назад в меню", "callback_data": "main_menu"}],
+    ]
+}
+
 
 def get_main_menu():
     text = (
@@ -180,7 +226,8 @@ def get_main_menu():
         f"Слежу за репозиторием <code>{esc(REPO_OWNER)}/{esc(REPO_NAME)}</code> "
         "и сразу присылаю уведомление о новых коммитах.\n\n"
         f"📄 Если изменится <code>{esc(WATCH_FILE)}</code>, пришлю его файлом. "
-        "Получить прямо сейчас: /file\n\n"
+        "Получить прямо сейчас: /file\n"
+        "🔄 Проверить GitHub немедленно: /check\n\n"
         "Выбери действие 👇"
     )
     keyboard = {
@@ -188,6 +235,9 @@ def get_main_menu():
             [
                 {"text": "📊 Последний коммит", "callback_data": "check_commit"},
                 {"text": "📜 Последние 5", "callback_data": "list_commits"},
+            ],
+            [
+                {"text": "🔄 Принудительная проверка", "callback_data": "force_check"},
             ],
             [
                 {"text": "📁 О репозитории", "callback_data": "about_repo"},
@@ -202,6 +252,101 @@ def get_main_menu():
         ]
     }
     return text, keyboard
+
+
+# ==================== ПРОВЕРКА GITHUB (общая логика) ====================
+def notify_commit(c):
+    text = f"🚀 <b>Новый коммит в {esc(REPO_OWNER)}/{esc(REPO_NAME)}!</b>\n\n{fmt_commit(c)}"
+    kb = {
+        "inline_keyboard": [
+            [{"text": "🔗 Посмотреть на GitHub", "url": c["html_url"]}]
+        ]
+    }
+    send_message(CHAT_ID, text, reply_markup=kb)
+
+
+def check_commits(force=False):
+    """Возвращает (кол-во новых коммитов, ошибка). При force ETag игнорируется."""
+    etag = None if force else MONITOR["commit_etag"]
+    status, data, new_etag, err = gh_get("/commits?per_page=10", etag)
+
+    if status == 304:
+        return 0, None
+    if status == 200 and data:
+        MONITOR["commit_etag"] = new_etag
+        shas = [c["sha"] for c in data]
+        last_sha = MONITOR["commit_sha"]
+
+        if last_sha is None:
+            MONITOR["commit_sha"] = shas[0]
+            log.info("Текущий хэш: %s", shas[0][:7])
+            return 0, None
+        if shas[0] == last_sha:
+            return 0, None
+
+        new = data[: shas.index(last_sha)] if last_sha in shas else data
+        MONITOR["commit_sha"] = shas[0]
+        to_send = new[:5]
+        if CHAT_ID:
+            for c in reversed(to_send):
+                notify_commit(c)
+        log.info("Новых коммитов: %d, отправлено уведомлений: %d", len(new), len(to_send))
+        return len(new), None
+
+    return 0, err or "Пустой ответ от GitHub"
+
+
+def check_file():
+    """Возвращает (изменился ли файл, ошибка)."""
+    sha, raw, err = get_file()
+    if sha and raw is not None:
+        last = MONITOR["file_sha"]
+        if last is None:
+            MONITOR["file_sha"] = sha
+            log.info("Текущий sha файла: %s", sha[:7])
+            return False, None
+        if sha != last:
+            MONITOR["file_sha"] = sha
+            if CHAT_ID:
+                send_document(
+                    CHAT_ID,
+                    WATCH_FILE.split("/")[-1],
+                    raw,
+                    f"📄 <b>{esc(WATCH_FILE)}</b> обновлён",
+                )
+            log.info("Файл %s изменился, отправлен", WATCH_FILE)
+            return True, None
+        return False, None
+    return False, err or "Пустой ответ от GitHub"
+
+
+def run_check(force=False):
+    """Одна полная проверка (коммиты + файл). Используется и таймером, и кнопкой."""
+    with CHECK_LOCK:
+        result = {"new_commits": 0, "file_changed": False, "errors": []}
+        try:
+            n, err = check_commits(force)
+            result["new_commits"] = n
+            if err:
+                result["errors"].append(f"коммиты: {err}")
+        except Exception as e:
+            log.exception("Ошибка проверки коммитов")
+            result["errors"].append(f"коммиты: {e}")
+
+        try:
+            changed, err = check_file()
+            result["file_changed"] = changed
+            if err:
+                result["errors"].append(f"файл: {err}")
+        except Exception as e:
+            log.exception("Ошибка проверки файла")
+            result["errors"].append(f"файл: {e}")
+
+        STATE["last_check"] = time.time()
+        STATE["last_error"] = "; ".join(result["errors"]) or None
+        for e in result["errors"]:
+            log.warning("Ошибка проверки: %s", e)
+        return result
 
 
 # ==================== ЭКРАНЫ ====================
@@ -267,51 +412,27 @@ def screen_status():
     return text, BACK_KB
 
 
-# ==================== МОНИТОРИНГ ГИТХАБА (ПОТОК 1) ====================
-def notify_commit(c):
-    text = f"🚀 <b>Новый коммит в {esc(REPO_OWNER)}/{esc(REPO_NAME)}!</b>\n\n{fmt_commit(c)}"
-    kb = {
-        "inline_keyboard": [
-            [{"text": "🔗 Посмотреть на GitHub", "url": c["html_url"]}]
-        ]
-    }
-    send_message(CHAT_ID, text, reply_markup=kb)
+def screen_force_check():
+    r = run_check(force=True)
+    commits_txt = (
+        f"🚀 новых коммитов: <b>{r['new_commits']}</b> (уведомления отправлены)"
+        if r["new_commits"]
+        else "✅ новых коммитов нет"
+    )
+    file_txt = (
+        f"📄 <code>{esc(WATCH_FILE)}</code> изменился — файл отправлен"
+        if r["file_changed"]
+        else f"✅ <code>{esc(WATCH_FILE)}</code> без изменений"
+    )
+    text = f"🔄 <b>Принудительная проверка выполнена</b>\n\n• {commits_txt}\n• {file_txt}"
+    if r["errors"]:
+        text += "\n\n⚠️ <b>Ошибки:</b>\n" + "\n".join(
+            f"<code>{esc(e)}</code>" for e in r["errors"]
+        )
+    return text, CHECK_KB
 
 
-def github_monitor_thread():
-    print("🚀 [GitHub Monitor] Запущен мониторинг коммитов...")
-    if not CHAT_ID:
-        print("⚠️ CHAT_ID не задан — уведомления отправляться не будут!")
-
-    last_sha, etag = None, None
-    while True:
-        try:
-            status, data, new_etag, err = gh_get("/commits?per_page=10", etag)
-            STATE["last_check"] = time.time()
-            STATE["last_error"] = err
-
-            if status == 200 and data:
-                etag = new_etag
-                shas = [c["sha"] for c in data]
-                if last_sha is None:
-                    last_sha = shas[0]
-                    print(f"📌 Текущий хэш: {last_sha[:7]}")
-                elif shas[0] != last_sha:
-                    new = data[: shas.index(last_sha)] if last_sha in shas else data
-                    last_sha = shas[0]
-                    if CHAT_ID:
-                        for c in reversed(new[:5]):
-                            notify_commit(c)
-                        print(f"✅ Отправлено уведомлений: {len(new[:5])}")
-            elif err:
-                print(f"Ошибка GitHub API: {err}")
-        except Exception as e:
-            STATE["last_error"] = str(e)
-            print(f"Ошибка мониторинга: {e}")
-        time.sleep(CHECK_INTERVAL)
-
-
-# ==================== СЛЕЖЕНИЕ ЗА ФАЙЛОМ (ПОТОК 3) ====================
+# ==================== ОТПРАВКА ФАЙЛА ====================
 def send_document(chat_id, filename, content, caption=None):
     """Отправляет файл в Telegram (multipart/form-data, без сторонних библиотек)."""
     boundary = "----tgbot" + str(int(time.time() * 1000))
@@ -338,7 +459,7 @@ def send_document(chat_id, filename, content, caption=None):
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode())
     except Exception as e:
-        print(f"Ошибка sendDocument: {e}")
+        log.error("Ошибка sendDocument: %s", e)
         return None
 
 
@@ -360,30 +481,13 @@ def get_file():
     return None, None, err or "Пустой ответ от GitHub"
 
 
-def file_monitor_thread():
-    print(f"📄 [File Monitor] Слежу за файлом {WATCH_FILE}...")
-    last_sha = None
+# ==================== АВТОМАТИЧЕСКИЙ МОНИТОРИНГ (ПОТОК 1) ====================
+def monitor_thread():
+    log.info("Запущен мониторинг коммитов и файла %s (каждые %d с)", WATCH_FILE, CHECK_INTERVAL)
+    if not CHAT_ID:
+        log.warning("CHAT_ID не задан — уведомления отправляться не будут!")
     while True:
-        try:
-            sha, raw, err = get_file()
-            if sha and raw is not None:
-                if last_sha is None:
-                    last_sha = sha
-                    print(f"📌 Текущий sha файла: {sha[:7]}")
-                elif sha != last_sha:
-                    last_sha = sha
-                    if CHAT_ID:
-                        send_document(
-                            CHAT_ID,
-                            WATCH_FILE.split("/")[-1],
-                            raw,
-                            f"📄 <b>{esc(WATCH_FILE)}</b> обновлён",
-                        )
-                        print("✅ Файл отправлен")
-            elif err:
-                print(f"Ошибка слежения за файлом: {err}")
-        except Exception as e:
-            print(f"Ошибка слежения за файлом: {e}")
+        run_check(force=False)
         time.sleep(CHECK_INTERVAL)
 
 
@@ -392,7 +496,19 @@ def handle_update(update):
     if "message" in update:
         msg = update["message"]
         chat_id = msg["chat"]["id"]
+
+        # --- Whitelist ---
+        if not is_allowed(chat_id):
+            log.warning(
+                "Игнорирую сообщение от чужого чата: chat_id=%s, user=%s, text=%r",
+                chat_id,
+                (msg.get("from") or {}).get("username"),
+                (msg.get("text") or "")[:50],
+            )
+            return
+
         text = (msg.get("text") or "").split("@")[0].strip()
+        log.info("Команда: %s", text)
 
         if text == "/start":
             t, kb = get_main_menu()
@@ -402,6 +518,10 @@ def handle_update(update):
             send_message(chat_id, t, reply_markup=kb)
         elif text == "/commits":
             t, kb = screen_commit_list()
+            send_message(chat_id, t, reply_markup=kb)
+        elif text == "/check":
+            send_message(chat_id, "🔄 Проверяю GitHub...")
+            t, kb = screen_force_check()
             send_message(chat_id, t, reply_markup=kb)
         elif text == "/file":
             sha, raw, err = get_file()
@@ -417,21 +537,33 @@ def handle_update(update):
         msg_id = cb["message"]["message_id"]
         data = cb.get("data")
 
+        # --- Whitelist ---
+        if not is_allowed(chat_id):
+            log.warning(
+                "Игнорирую нажатие кнопки от чужого чата: chat_id=%s, data=%r",
+                chat_id,
+                data,
+            )
+            return
+
+        log.info("Кнопка: %s", data)
         screens = {
             "main_menu": get_main_menu,
             "check_commit": screen_last_commit,
             "list_commits": screen_commit_list,
             "about_repo": screen_repo_info,
             "bot_status": screen_status,
+            "force_check": screen_force_check,
         }
-        answer_callback_query(cb_id, "Загружаю..." if data in ("check_commit", "list_commits", "about_repo") else None)
+        loading = ("check_commit", "list_commits", "about_repo", "force_check")
+        answer_callback_query(cb_id, "Загружаю..." if data in loading else None)
         if data in screens:
             t, kb = screens[data]()
             edit_message_text(chat_id, msg_id, t, reply_markup=kb)
 
 
 def telegram_polling_thread():
-    print("💬 [Telegram Polling] Запущена обработка команд и кнопок...")
+    log.info("Запущена обработка команд и кнопок")
     setup_bot_commands()
     offset = 0
     while True:
@@ -449,15 +581,17 @@ def telegram_polling_thread():
                 offset = update["update_id"] + 1
                 try:
                     handle_update(update)
-                except Exception as e:
-                    print(f"Ошибка обработки обновления: {e}")
+                except Exception:
+                    log.exception("Ошибка обработки обновления")
         else:
             time.sleep(5)
 
 
 # ==================== ТОЧКА ВХОДА ====================
 if __name__ == "__main__":
-    # Фоновые потоки: коммиты и файл, основной цикл — Telegram
-    threading.Thread(target=github_monitor_thread, daemon=True).start()
-    threading.Thread(target=file_monitor_thread, daemon=True).start()
+    setup_logging()
+    log.info("Бот запускается. Репозиторий: %s/%s", REPO_OWNER, REPO_NAME)
+    # Фоновый поток: коммиты и файл; основной цикл — Telegram
+    threading.Thread(target=monitor_thread, name="monitor", daemon=True).start()
+    threading.current_thread().name = "telegram"
     telegram_polling_thread()
