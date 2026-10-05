@@ -18,23 +18,35 @@ TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
 TWITCH_LOGIN = os.environ.get("TWITCH_LOGIN", "fatsphynx").lower()
 STREAMER_NAME = os.environ.get("STREAMER_NAME", "Сфинкса")  # в родительном падеже: "Стрим у ..."
 
-# Куда слать уведомления: id групп/чатов через запятую (у групп id начинается с -100...)
+# Чаты, которые подписаны всегда (id через запятую). Необязательно:
+# бот сам запоминает любую группу, в которую его добавили.
 CHAT_IDS = [x.strip() for x in os.environ.get("CHAT_IDS", "").split(",") if x.strip()]
 
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))  # как часто опрашивать Twitch (сек)
 OFFLINE_GRACE = int(os.environ.get("OFFLINE_GRACE", "5"))  # сколько проверок подряд "оффлайн", чтобы считать стрим завершённым
 SEND_PREVIEW = os.environ.get("SEND_PREVIEW", "1") == "1"  # присылать картинку-превью стрима
-STATE_FILE = os.environ.get("STATE_FILE", "state.json")
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")  # идёт ли стрим
+CHATS_FILE = os.environ.get("CHATS_FILE", "chats.json")  # список подписанных чатов
 LOG_FILE = os.environ.get("LOG_FILE", "twitch_bot.log")
 
 STREAM_URL = f"https://www.twitch.tv/{TWITCH_LOGIN}"
 START_TIME = time.time()
+BOT_USERNAME = ""
 
 log = logging.getLogger("twitch_bot")
 TOKEN = {"value": None, "expires": 0}
 TOKEN_LOCK = threading.Lock()
 CHECK_LOCK = threading.Lock()
-STATE = {"is_live": False, "offline_count": 0, "stream_id": None, "last_check": None, "last_error": None}
+SUBS_LOCK = threading.Lock()
+SUBS = set()  # id чатов, куда шлём уведомления
+STATE = {
+    "is_live": False,
+    "offline_count": 0,
+    "stream_id": None,
+    "stream": None,
+    "last_check": None,
+    "last_error": None,
+}
 
 
 # ==================== ЛОГИРОВАНИЕ ====================
@@ -51,6 +63,64 @@ def setup_logging():
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     root.addHandler(ch)
+
+
+# ==================== ПОДПИСАННЫЕ ЧАТЫ ====================
+def load_chats():
+    try:
+        with open(CHATS_FILE, encoding="utf-8") as f:
+            SUBS.update(str(x) for x in json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Не удалось прочитать %s: %s", CHATS_FILE, e)
+    SUBS.update(CHAT_IDS)
+
+
+def _save_chats():
+    try:
+        with open(CHATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(SUBS), f)
+    except Exception as e:
+        log.warning("Не удалось сохранить %s: %s", CHATS_FILE, e)
+
+
+def add_chat(chat_id):
+    """Возвращает True, если чат был добавлен только что."""
+    with SUBS_LOCK:
+        cid = str(chat_id)
+        if cid in SUBS:
+            return False
+        SUBS.add(cid)
+        _save_chats()
+    log.info("Чат подписан: %s (всего: %d)", cid, len(SUBS))
+    return True
+
+
+def remove_chat(chat_id):
+    with SUBS_LOCK:
+        cid = str(chat_id)
+        if cid not in SUBS:
+            return False
+        SUBS.discard(cid)
+        _save_chats()
+    log.info("Чат отписан: %s (всего: %d)", cid, len(SUBS))
+    return True
+
+
+def migrate_chat(old_id, new_id):
+    """Группа стала супергруппой — id поменялся."""
+    with SUBS_LOCK:
+        if str(old_id) in SUBS:
+            SUBS.discard(str(old_id))
+            SUBS.add(str(new_id))
+            _save_chats()
+            log.info("Чат %s переехал в %s", old_id, new_id)
+
+
+def subscribers():
+    with SUBS_LOCK:
+        return list(SUBS)
 
 
 # ==================== HTTP ====================
@@ -114,6 +184,8 @@ def get_stream():
 
 # ==================== TELEGRAM API ====================
 def tg_api(method, payload=None, timeout=15):
+    """При ошибке Telegram возвращает его ответ ({"ok": False, "error_code": ..., ...}),
+    при сбое сети — None."""
     if not BOT_TOKEN:
         log.error("BOT_TOKEN не установлен!")
         return None
@@ -125,7 +197,17 @@ def tg_api(method, payload=None, timeout=15):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        log.error("Ошибка TG API (%s): %s %s", method, e.code, e.read().decode(errors="ignore")[:200])
+        body = e.read().decode(errors="ignore")
+        log.error("Ошибка TG API (%s): %s %s", method, e.code, body[:200])
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                parsed.setdefault("ok", False)
+                parsed.setdefault("error_code", e.code)
+                return parsed
+        except Exception:
+            pass
+        return {"ok": False, "error_code": e.code, "description": body[:200]}
     except Exception as e:
         log.error("Ошибка TG API (%s): %s", method, e)
     return None
@@ -161,22 +243,39 @@ def setup_bot_commands():
         {
             "commands": [
                 {"command": "stream", "description": "Идёт ли стрим сейчас"},
+                {"command": "stop", "description": "Отключить уведомления в этом чате"},
+                {"command": "start", "description": "Включить уведомления в этом чате"},
                 {"command": "id", "description": "Показать id этого чата"},
             ]
         },
     )
 
 
+def load_bot_username():
+    global BOT_USERNAME
+    res = tg_api("getMe")
+    if res and res.get("ok"):
+        BOT_USERNAME = res["result"].get("username", "")
+        log.info("Бот: @%s", BOT_USERNAME)
+
+
+def is_chat_admin(chat, msg):
+    """В личке — всегда да. В группе — только админы."""
+    if chat.get("type") == "private":
+        return True
+    sender_chat = msg.get("sender_chat")  # анонимный админ
+    if sender_chat and sender_chat.get("id") == chat["id"]:
+        return True
+    user_id = (msg.get("from") or {}).get("id")
+    if not user_id:
+        return False
+    res = tg_api("getChatMember", {"chat_id": chat["id"], "user_id": user_id})
+    return bool(res and res.get("ok") and res["result"].get("status") in ("creator", "administrator"))
+
+
 # ==================== ФОРМАТИРОВАНИЕ ====================
 def esc(s):
     return html.escape(str(s), quote=False)
-
-
-def fmt_uptime(seconds):
-    d, r = divmod(int(seconds), 86400)
-    h, r = divmod(r, 3600)
-    m, _ = divmod(r, 60)
-    return f"{d}д {h}ч {m}м" if d else f"{h}ч {m}м"
 
 
 def stream_card(stream, header):
@@ -200,21 +299,49 @@ def preview_url(stream):
     return f"{thumb}?t={int(time.time())}"  # cache-buster, чтобы Telegram не взял старую картинку
 
 
+def greeting_text():
+    return (
+        f"👋 Привет! Буду писать сюда, когда у {esc(STREAMER_NAME)} начнётся стрим на Twitch.\n\n"
+        "/stream — идёт ли стрим сейчас\n"
+        "/stop — отключить уведомления (для админов группы)\n"
+        "/start — включить обратно"
+    )
+
+
 # ==================== УВЕДОМЛЕНИЯ ====================
+def handle_send_error(chat_id, res):
+    """Если бота выгнали/группа удалена — отписываем чат; если группа переехала — меняем id."""
+    migrate_to = (res.get("parameters") or {}).get("migrate_to_chat_id")
+    if migrate_to:
+        migrate_chat(chat_id, migrate_to)
+        return
+    code = res.get("error_code")
+    desc = (res.get("description") or "").lower()
+    dead = (code == 403 and "rights" not in desc) or "chat not found" in desc or "was deleted" in desc
+    if dead:
+        remove_chat(chat_id)
+
+
 def announce(stream):
     text, kb = stream_card(stream, f"🔴 <b>Стрим у {esc(STREAMER_NAME)}!</b>")
-    for chat_id in CHAT_IDS:
-        sent = None
+    chats = subscribers()
+    log.info("Рассылка уведомления в %d чат(ов)", len(chats))
+    for chat_id in chats:
+        res = None
         if SEND_PREVIEW:
             url = preview_url(stream)
             if url:
-                sent = send_photo(chat_id, url, text, kb)
-        if not (sent and sent.get("ok")):  # нет превью или не получилось — шлём обычным текстом
-            sent = send_message(chat_id, text, kb)
-        log.info("Уведомление в %s: %s", chat_id, "ок" if sent and sent.get("ok") else "ошибка")
+                res = send_photo(chat_id, url, text, kb)
+        if not (res and res.get("ok")):  # нет превью или не получилось — шлём обычным текстом
+            res = send_message(chat_id, text, kb)
+        ok = bool(res and res.get("ok"))
+        log.info("Уведомление в %s: %s", chat_id, "ок" if ok else "ошибка")
+        if res and not ok:
+            handle_send_error(chat_id, res)
+        time.sleep(0.1)  # не упираемся в лимиты Telegram
 
 
-# ==================== СОСТОЯНИЕ ====================
+# ==================== СОСТОЯНИЕ СТРИМА ====================
 def load_state():
     """Возвращает True, если состояние было сохранено раньше."""
     try:
@@ -251,6 +378,7 @@ def run_check():
         if err:
             log.warning("Ошибка проверки: %s", err)
             return None, err
+        STATE["stream"] = stream
 
         if stream:
             STATE["offline_count"] = 0
@@ -260,7 +388,6 @@ def run_check():
                 save_state()
                 if FIRST_RUN["baseline"]:
                     # первый запуск без файла состояния: стрим уже идёт — не спамим, просто запоминаем
-                    FIRST_RUN["baseline"] = False
                     log.info("Первый запуск: стрим уже идёт, уведомление пропущено")
                 else:
                     log.info("Стрим начался: %s", stream.get("title"))
@@ -281,9 +408,7 @@ def run_check():
 
 
 def monitor_thread():
-    log.info("Слежу за %s (каждые %d с), чатов для уведомлений: %d", STREAM_URL, CHECK_INTERVAL, len(CHAT_IDS))
-    if not CHAT_IDS:
-        log.warning("CHAT_IDS не задан — уведомления отправляться не будут! Напиши /id боту в группе.")
+    log.info("Слежу за %s (каждые %d с), подписанных чатов: %d", STREAM_URL, CHECK_INTERVAL, len(subscribers()))
     while True:
         try:
             run_check()
@@ -292,27 +417,61 @@ def monitor_thread():
         time.sleep(CHECK_INTERVAL)
 
 
-# ==================== КОМАНДЫ ====================
-def handle_update(update):
-    msg = update.get("message")
-    if not msg:
-        return
+# ==================== ОБРАБОТКА ОБНОВЛЕНИЙ ====================
+def handle_membership(ev):
+    """Бота добавили в чат / удалили из чата / заблокировали."""
+    chat = ev["chat"]
+    status = (ev.get("new_chat_member") or {}).get("status")
+    title = chat.get("title") or chat.get("username") or chat["id"]
+    if status in ("member", "administrator"):
+        if add_chat(chat["id"]):
+            log.info("Бота добавили в чат: %s (%s)", title, chat["id"])
+            if chat.get("type") != "private":
+                send_message(chat["id"], greeting_text())
+    elif status in ("left", "kicked"):
+        log.info("Бота убрали из чата: %s (%s)", title, chat["id"])
+        remove_chat(chat["id"])
+
+
+def handle_message(msg):
     chat = msg["chat"]
     chat_id = chat["id"]
-    text = (msg.get("text") or "").split("@")[0].split()[0] if msg.get("text") else ""
 
-    # /id работает в любом чате — нужен, чтобы узнать id группы для CHAT_IDS
-    if text == "/id":
+    if msg.get("migrate_to_chat_id"):
+        migrate_chat(chat_id, msg["migrate_to_chat_id"])
+        return
+
+    parts = (msg.get("text") or "").split()
+    if not parts or not parts[0].startswith("/"):
+        return
+    cmd, _, target = parts[0].partition("@")
+    cmd = cmd.lower()
+    # команда адресована другому боту (/id@other_bot) — не отвечаем
+    if target and BOT_USERNAME and target.lower() != BOT_USERNAME.lower():
+        return
+
+    if cmd == "/id":
         send_message(chat_id, f"🆔 id этого чата: <code>{chat_id}</code>")
-        return
 
-    # остальное — только в чатах из белого списка
-    if str(chat_id) not in CHAT_IDS:
-        log.warning("Игнорирую чужой чат: %s (%s)", chat_id, chat.get("title") or chat.get("username"))
-        return
+    elif cmd == "/start":
+        add_chat(chat_id)
+        send_message(chat_id, greeting_text())
 
-    if text == "/stream":
-        stream, err = run_check()
+    elif cmd == "/stop":
+        if not is_chat_admin(chat, msg):
+            send_message(chat_id, "⛔ Отключить уведомления могут только админы группы.")
+        elif remove_chat(chat_id):
+            send_message(chat_id, "🔕 Уведомления отключены. Включить обратно: /start")
+        else:
+            send_message(chat_id, "Уведомления тут и так отключены. Включить: /start")
+
+    elif cmd == "/stream":
+        # недавний результат берём из кэша, чтобы много чатов не долбили Twitch
+        fresh = STATE["last_check"] and time.time() - STATE["last_check"] < 20 and not STATE["last_error"]
+        if fresh:
+            stream, err = STATE["stream"], None
+        else:
+            stream, err = run_check()
         if err:
             send_message(chat_id, f"⚠️ Не удалось проверить Twitch: <code>{esc(err)}</code>")
         elif stream:
@@ -323,6 +482,13 @@ def handle_update(update):
             send_message(chat_id, f"⚫ У {esc(STREAMER_NAME)} сейчас оффлайн.", kb)
 
 
+def handle_update(update):
+    if "my_chat_member" in update:
+        handle_membership(update["my_chat_member"])
+    elif "message" in update:
+        handle_message(update["message"])
+
+
 def telegram_polling():
     log.info("Запущена обработка команд")
     setup_bot_commands()
@@ -330,7 +496,7 @@ def telegram_polling():
     while True:
         res = tg_api(
             "getUpdates",
-            {"offset": offset, "timeout": 30, "allowed_updates": ["message"]},
+            {"offset": offset, "timeout": 30, "allowed_updates": ["message", "my_chat_member"]},
             timeout=40,
         )
         if res and res.get("ok"):
@@ -353,7 +519,9 @@ if __name__ == "__main__":
         log.error("Не заданы переменные окружения: %s", ", ".join(missing))
         raise SystemExit(1)
 
+    load_chats()
     FIRST_RUN["baseline"] = not load_state()
+    load_bot_username()
     threading.Thread(target=monitor_thread, name="monitor", daemon=True).start()
     threading.current_thread().name = "telegram"
     telegram_polling()
