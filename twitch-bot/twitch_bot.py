@@ -64,6 +64,9 @@ STATE = {
 
 ADMIN_COMMANDS = ("/start", "/stop", "/status", "/chats", "/test", "/say")
 
+ANON_BOT_ID = 1087968824  # служебный аккаунт GroupAnonymousBot: так Telegram показывает "анонимного админа"
+ANON_CACHE = {}  # chat_id -> (время проверки, результат)
+
 
 # ==================== ЛОГИРОВАНИЕ ====================
 def setup_logging():
@@ -124,6 +127,26 @@ def is_admin(user):
 def admin_ids():
     with ADMINS_LOCK:
         return sorted(ADMIN_IDS | LEARNED_IDS)
+
+
+def is_anonymous_user(user):
+    return bool(user) and user.get("id") == ANON_BOT_ID
+
+
+def anonymous_admins_trusted(chat_id):
+    """Если человек пишет или добавляет бота «от имени группы» (анонимный админ), Telegram скрывает,
+    кто это. Смотрим список админов чата: доверяем, только если ВСЕ админы с включённой анонимностью — наши."""
+    now = time.time()
+    cached = ANON_CACHE.get(chat_id)
+    if cached and now - cached[0] < 300:
+        return cached[1]
+    res = tg_api("getChatAdministrators", {"chat_id": chat_id})
+    if not (res and res.get("ok")):
+        return False
+    anon = [m for m in res.get("result", []) if m.get("is_anonymous")]
+    trusted = bool(anon) and all(is_admin(m.get("user")) for m in anon)
+    ANON_CACHE[chat_id] = (now, trusted)
+    return trusted
 
 
 def who(user):
@@ -607,7 +630,7 @@ def handle_membership(ev):
     if is_subscribed(chat_id):
         return
 
-    if is_admin(frm):
+    if is_admin(frm) or (is_anonymous_user(frm) and anonymous_admins_trusted(chat_id)):
         if add_chat(chat_id, title):
             log.info("Бота добавил админ %s в чат %s (%s)", who(frm), title, chat_id)
             send_message(chat_id, greeting_text())
@@ -640,7 +663,9 @@ def handle_message(msg):
         return
 
     user = msg.get("from")
-    admin = is_admin(user)
+    # «от имени группы»: sender_chat совпадает с самим чатом (анонимный админ)
+    anon_sender = (msg.get("sender_chat") or {}).get("id") == chat_id or is_anonymous_user(user)
+    admin = is_admin(user) or (anon_sender and anonymous_admins_trusted(chat_id))
     subscribed = is_subscribed(chat_id)
     title = chat_title(chat)
 
