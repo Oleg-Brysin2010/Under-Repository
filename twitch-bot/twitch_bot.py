@@ -149,6 +149,24 @@ def anonymous_admins_trusted(chat_id):
     return trusted
 
 
+def admin_in_chat(chat_id):
+    """True, если в чате состоит хотя бы один админ бота (по числовому id)."""
+    for uid in admin_ids():
+        try:
+            res = tg_api("getChatMember", {"chat_id": chat_id, "user_id": int(uid)})
+        except ValueError:
+            continue
+        if not (res and res.get("ok")):
+            continue
+        member = res.get("result") or {}
+        status = member.get("status")
+        if status in ("creator", "administrator", "member"):
+            return True
+        if status == "restricted" and member.get("is_member", True):
+            return True
+    return False
+
+
 def who(user):
     if not user:
         return "неизвестно"
@@ -630,7 +648,11 @@ def handle_membership(ev):
     if is_subscribed(chat_id):
         return
 
-    if is_admin(frm) or (is_anonymous_user(frm) and anonymous_admins_trusted(chat_id)):
+    if (
+        is_admin(frm)
+        or (is_anonymous_user(frm) and anonymous_admins_trusted(chat_id))
+        or admin_in_chat(chat_id)  # в чате есть админ бота — остаёмся, кто бы ни добавил
+    ):
         if add_chat(chat_id, title):
             log.info("Бота добавил админ %s в чат %s (%s)", who(frm), title, chat_id)
             send_message(chat_id, greeting_text())
