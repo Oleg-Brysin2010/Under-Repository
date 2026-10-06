@@ -2,6 +2,7 @@ import html
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -312,6 +313,13 @@ def twitch_token(force=False):
 
 
 def get_stream():
+    """Официальный API Twitch, если заданы ключи; иначе публичный прокси decapi.me (без ключей)."""
+    if keys_configured():
+        return get_stream_official()
+    return get_stream_public()
+
+
+def get_stream_official():
     """Возвращает (stream | None если оффлайн, ошибка)."""
     token, err = twitch_token()
     if not token:
@@ -332,6 +340,58 @@ def get_stream():
             return (live[0] if live else None), None
         return None, err or "пустой ответ Twitch"
     return None, "не удалось обратиться к Twitch"
+
+
+# ==================== РЕЖИМ БЕЗ КЛЮЧЕЙ (публичный прокси decapi.me) ====================
+DECAPI = "https://decapi.me/twitch/"
+_TIME_WORDS = re.compile(r"\b(and|seconds?|minutes?|hours?|days?|weeks?|months?|years?)\b", re.I)
+
+
+def http_text(url, timeout=15):
+    """Возвращает (status, текст, ошибка)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "twitch-telegram-bot"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode(errors="ignore").strip(), None
+    except urllib.error.HTTPError as e:
+        return e.code, None, f"HTTP {e.code}"
+    except Exception as e:
+        return 0, None, str(e)
+
+
+def get_stream_public():
+    """Проверка стрима без ключей через бесплатный публичный сервис decapi.me.
+    Возвращает (stream | None если оффлайн, ошибка). Сервис неофициальный, без гарантий."""
+    login = urllib.parse.quote(TWITCH_LOGIN)
+    status, body, err = http_text(f"{DECAPI}uptime/{login}")
+    if err or not body:
+        return None, f"decapi.me недоступен: {err or 'пустой ответ'}"
+    low = body.lower()
+    if "offline" in low:
+        return None, None
+    # Если стрим идёт, сервис отвечает только временем: "1 hour, 5 minutes"
+    leftover = re.sub(r"[\d\s,]", "", _TIME_WORDS.sub("", body))
+    if leftover:
+        return None, f"decapi.me вернул неожиданный ответ: {body[:100]}"
+
+    def fetch(endpoint):
+        st, text, e = http_text(f"{DECAPI}{endpoint}/{login}")
+        return text if (not e and text) else None
+
+    title = fetch("title") or "Без названия"
+    game = fetch("game")
+    viewers = fetch("viewercount")
+    try:
+        viewer_count = int(viewers) if viewers is not None else None
+    except ValueError:
+        viewer_count = None
+    return {
+        "id": "public",
+        "title": title,
+        "game_name": game,
+        "viewer_count": viewer_count,
+        "thumbnail_url": f"https://static-cdn.jtvnw.net/previews-ttv/live_user_{TWITCH_LOGIN}-{{width}}x{{height}}.jpg",
+    }, None
 
 
 # ==================== TELEGRAM API ====================
@@ -528,8 +588,8 @@ def run_check():
         if err:
             log.warning("Ошибка проверки: %s", err)
             STATE["fail_count"] += 1
-            # Если Twitch долго недоступен — сообщаем админам один раз (пока ключи не настроены, молчим)
-            if keys_configured() and STATE["fail_count"] >= ALERT_AFTER and not STATE["alerted"]:
+            # Если Twitch (или decapi.me) долго недоступен — сообщаем админам один раз
+            if STATE["fail_count"] >= ALERT_AFTER and not STATE["alerted"]:
                 STATE["alerted"] = True
                 notify_admins(
                     f"⚠️ Twitch не отвечает уже {STATE['fail_count']} проверок подряд.\n"
@@ -586,10 +646,10 @@ def cmd_status():
         last = fmt_uptime(time.time() - STATE["last_check"]) + " назад"
     else:
         last = "ещё не было"
-    if not keys_configured():
-        keys = "не настроены ❌ (стоят заглушки)"
+    if keys_configured():
+        keys = "официальный API Twitch ✅"
     else:
-        keys = "заданы ✅"
+        keys = "без ключей, через decapi.me ⚠️"
     if STATE["last_error"]:
         live = "❓ неизвестно (ошибка Twitch)"
     else:
@@ -598,7 +658,7 @@ def cmd_status():
         f"{'🟡' if STATE['last_error'] else '🟢'} <b>Бот работает</b>\n\n"
         f"• <b>Аптайм:</b> {fmt_uptime(time.time() - START_TIME)}\n"
         f"• <b>Канал:</b> {esc(TWITCH_LOGIN)} — {live}\n"
-        f"• <b>Ключи Twitch:</b> {keys}\n"
+        f"• <b>Режим Twitch:</b> {keys}\n"
         f"• <b>Последняя проверка:</b> {last}\n"
         f"• <b>Подписанных чатов:</b> {len(subscribers())}\n"
         f"• <b>Админов известно:</b> {len(admin_ids())}"
@@ -786,11 +846,13 @@ def telegram_polling():
 # ==================== ТОЧКА ВХОДА ====================
 if __name__ == "__main__":
     setup_logging()
-    missing = [n for n, v in (("BOT_TOKEN", BOT_TOKEN), ("TWITCH_CLIENT_ID", TWITCH_CLIENT_ID),
-                              ("TWITCH_CLIENT_SECRET", TWITCH_CLIENT_SECRET)) if not v]
-    if missing:
-        log.error("Не заданы переменные окружения: %s", ", ".join(missing))
+    if not BOT_TOKEN:
+        log.error("Не задана переменная окружения BOT_TOKEN")
         raise SystemExit(1)
+    if keys_configured():
+        log.info("Режим Twitch: официальный API")
+    else:
+        log.info("Режим Twitch: без ключей (публичный прокси decapi.me)")
 
     load_admins()
     load_chats()
