@@ -31,6 +31,7 @@ FINGERPRINT = os.environ.get("FINGERPRINT", "chrome")
 PROFILE_TITLE = os.environ.get("PROFILE_TITLE", "🚀 Мой VPN | Нидерланды 🚀")
 CONFIG_NAME_1 = os.environ.get("CONFIG_NAME_1", "🇳🇱 Нидерланды | РФ напрямую")
 CONFIG_NAME_2 = os.environ.get("CONFIG_NAME_2", "🇳🇱 Нидерланды | всё через VPN")
+CONFIG_NAME_0 = os.environ.get("CONFIG_NAME_0", "🇳🇱 Нидерланды | как раньше")
 
 TOTAL_GB = float(os.environ.get("TOTAL_GB", "1000"))  # "лимит" для полосы; 0 — без полосы
 EXPIRE_TS = int(os.environ.get("EXPIRE_TS", "4102444799"))  # по умолчанию 31.12.2099
@@ -164,8 +165,31 @@ def build_config(remarks, ru_direct):
     }
 
 
+def build_legacy_config(remarks):
+    """Старый, проверенный конфиг (как был у тебя до улучшений): запасной вариант."""
+    cfg = build_config(remarks, True)
+    cfg["dns"] = {
+        "servers": [
+            "https://1.1.1.1/dns-query",
+            "https://8.8.8.8/dns-query",
+            "https://dns.quad9.net/dns-query",
+            "1.1.1.1",
+            "8.8.8.8",
+        ],
+        "queryStrategy": "IPIfNonMatch",
+    }
+    cfg["routing"]["rules"] = cfg["routing"]["rules"][:4]  # без блокировки UDP 443
+    cfg["inbounds"][0]["sniffing"] = {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"]}
+    cfg["outbounds"][0]["streamSettings"]["realitySettings"]["fingerprint"] = "firefox"
+    return cfg
+
+
 def build_subscription():
-    return [build_config(CONFIG_NAME_1, True), build_config(CONFIG_NAME_2, False)]
+    return [
+        build_legacy_config(CONFIG_NAME_0),
+        build_config(CONFIG_NAME_1, True),
+        build_config(CONFIG_NAME_2, False),
+    ]
 
 
 # ==================== УЧЁТ ТРАФИКА (приблизительный) ====================
