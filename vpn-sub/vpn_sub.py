@@ -31,7 +31,7 @@ FINGERPRINT = os.environ.get("FINGERPRINT", "chrome")
 PROFILE_TITLE = os.environ.get("PROFILE_TITLE", "🚀 Мой VPN | Нидерланды 🚀")
 CONFIG_NAME_1 = os.environ.get("CONFIG_NAME_1", "🇳🇱 Нидерланды | РФ напрямую")
 CONFIG_NAME_2 = os.environ.get("CONFIG_NAME_2", "🇳🇱 Нидерланды | всё через VPN")
-CONFIG_NAME_0 = os.environ.get("CONFIG_NAME_0", "🇳🇱 Нидерланды | как раньше")
+CONFIG_NAME_0 = os.environ.get("CONFIG_NAME_0", "♡ᴏȹиᴄ ᴘᴋʜ ʙ ʜидᴇᴘлᴀʜдᴀx♡")
 
 TOTAL_GB = float(os.environ.get("TOTAL_GB", "1000"))  # "лимит" для полосы; 0 — без полосы
 EXPIRE_TS = int(os.environ.get("EXPIRE_TS", "4102444799"))  # по умолчанию 31.12.2099
