@@ -1,8 +1,11 @@
 """Сервер подписки для VPN (Xray, VLESS + Reality).
 
-Отдаёт по секретной ссылке массив JSON-конфигов и заголовки, по которым приложение
-рисует название группы, полосу трафика и дату окончания (как у друга на скрине).
-Секреты (UUID, ключи) здесь не хранятся: всё берётся из переменных окружения (.env на сервере).
+Отдаёт по секретной ссылке JSON-конфиг и заголовки, по которым приложение
+рисует название группы, полосу трафика и дату окончания.
+
+Секреты (UUID, ключи) берутся из переменных окружения (.env на сервере).
+Названия, лимит, дата и т.п. берутся из settings.json и перечитываются
+при КАЖДОМ запросе подписки, поэтому перезапускать сервис не нужно.
 """
 import base64
 import hmac
@@ -15,7 +18,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
-# ==================== НАСТРОЙКИ ====================
+# ==================== СЕКРЕТЫ И СЕРВЕР (.env) ====================
 SUB_SECRET = os.environ.get("SUB_SECRET", "")  # секретная часть ссылки
 SUB_HOST = os.environ.get("SUB_HOST", "0.0.0.0")
 SUB_PORT = int(os.environ.get("SUB_PORT", "8088"))
@@ -26,27 +29,43 @@ VLESS_UUID = os.environ.get("VLESS_UUID", "")
 REALITY_PUBLIC_KEY = os.environ.get("REALITY_PUBLIC_KEY", "")
 REALITY_SHORT_ID = os.environ.get("REALITY_SHORT_ID", "")
 REALITY_SNI = os.environ.get("REALITY_SNI", "dl.google.com")
-FINGERPRINT = os.environ.get("FINGERPRINT", "chrome")
-
-PROFILE_TITLE = os.environ.get("PROFILE_TITLE", "🚀 Мой VPN | Нидерланды 🚀")
-CONFIG_NAME_1 = os.environ.get("CONFIG_NAME_1", "🇳🇱 Нидерланды | РФ напрямую")
-CONFIG_NAME_2 = os.environ.get("CONFIG_NAME_2", "🇳🇱 Нидерланды | всё через VPN")
-CONFIG_NAME_0 = os.environ.get("CONFIG_NAME_0", "♡ᴏȹиᴄ ᴘᴋʜ ʙ ʜидᴇᴘлᴀʜдᴀx♡")
-
-TOTAL_GB = float(os.environ.get("TOTAL_GB", "1000"))  # "лимит" для полосы; 0 — без полосы
-EXPIRE_TS = int(os.environ.get("EXPIRE_TS", "4102444799"))  # по умолчанию 31.12.2099
-UPDATE_HOURS = int(os.environ.get("UPDATE_HOURS", "6"))  # как часто приложение обновляет подписку
-SUPPORT_URL = os.environ.get("SUPPORT_URL", "")
-WEB_PAGE_URL = os.environ.get("WEB_PAGE_URL", "")
 
 SSL_CERT = os.environ.get("SSL_CERT", "")  # по желанию: https
 SSL_KEY = os.environ.get("SSL_KEY", "")
 
 USAGE_FILE = os.environ.get("USAGE_FILE", "usage.json")
 LOG_FILE = os.environ.get("LOG_FILE", "vpn_sub.log")
+SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
+
+# ==================== НАСТРОЙКИ ПО УМОЛЧАНИЮ ====================
+# Любое из этих значений можно переопределить в settings.json
+DEFAULT_SETTINGS = {
+    "profile_title": "🚀 Мой VPN | Нидерланды 🚀",  # название группы (верхняя строка)
+    "config_name": "🇳🇱 Нидерланды | как раньше",   # название конфига
+    "total_gb": 1000,                                # лимит для полосы; 0 — без полосы
+    "expire_ts": 4102444799,                         # дата окончания (unix), 31.12.2099
+    "update_hours": 6,                               # как часто приложение обновляет подписку
+    "support_url": "",
+    "web_page_url": "",
+}
 
 log = logging.getLogger("vpn_sub")
 USAGE_LOCK = threading.Lock()
+
+
+def load_settings():
+    """Читает settings.json при каждом запросе. Если файла нет или он битый — берёт значения по умолчанию."""
+    s = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            s.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Не удалось прочитать %s (%s), использую значения по умолчанию", SETTINGS_FILE, e)
+    return s
 
 
 # ==================== ЛОГИРОВАНИЕ ====================
@@ -62,7 +81,7 @@ def setup_logging():
     root.addHandler(ch)
 
 
-# ==================== КОНФИГИ ====================
+# ==================== КОНФИГ ====================
 RU_DIRECT_DOMAINS = [
     "geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai",
     "domain:sberbank.com", "domain:vtb.com", "domain:vk.com", "domain:vk.me",
@@ -153,7 +172,7 @@ def build_config(remarks, ru_direct):
                         "serverName": REALITY_SNI,
                         "publicKey": REALITY_PUBLIC_KEY,
                         "shortId": REALITY_SHORT_ID,
-                        "fingerprint": FINGERPRINT,
+                        "fingerprint": "chrome",
                         "spiderX": "",
                     },
                     "sockopt": {"tcpFastOpen": True, "tcpKeepAliveInterval": 15},
@@ -166,7 +185,7 @@ def build_config(remarks, ru_direct):
 
 
 def build_legacy_config(remarks):
-    """Старый, проверенный конфиг (как был у тебя до улучшений): запасной вариант."""
+    """Старый, проверенный конфиг («как раньше»)."""
     cfg = build_config(remarks, True)
     cfg["dns"] = {
         "servers": [
@@ -184,11 +203,10 @@ def build_legacy_config(remarks):
     return cfg
 
 
-def build_subscription():
+def build_subscription(settings):
+    # Один конфиг. Чтобы добавить ещё, допиши build_config(...) в этот список.
     return [
-        build_legacy_config(CONFIG_NAME_0),
-        build_config(CONFIG_NAME_1, True),
-        build_config(CONFIG_NAME_2, False),
+        build_legacy_config(settings["config_name"]),
     ]
 
 
@@ -269,22 +287,23 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        body = json.dumps(build_subscription(), ensure_ascii=False).encode("utf-8")
+        s = load_settings()  # свежие настройки при каждом запросе
+        body = json.dumps(build_subscription(s), ensure_ascii=False).encode("utf-8")
         used = update_usage()
-        title = "base64:" + base64.b64encode(PROFILE_TITLE.encode("utf-8")).decode()
-        total = int(TOTAL_GB * 1024 ** 3)
+        title = "base64:" + base64.b64encode(str(s["profile_title"]).encode("utf-8")).decode()
+        total = int(float(s["total_gb"]) * 1024 ** 3)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Profile-Title", title)
-        self.send_header("Profile-Update-Interval", str(UPDATE_HOURS))
-        self.send_header("Subscription-Userinfo", f"upload=0; download={used}; total={total}; expire={EXPIRE_TS}")
-        if SUPPORT_URL:
-            self.send_header("Support-Url", SUPPORT_URL)
-        if WEB_PAGE_URL:
-            self.send_header("Profile-Web-Page-Url", WEB_PAGE_URL)
+        self.send_header("Profile-Update-Interval", str(s["update_hours"]))
+        self.send_header("Subscription-Userinfo", f"upload=0; download={used}; total={total}; expire={int(s['expire_ts'])}")
+        if s["support_url"]:
+            self.send_header("Support-Url", str(s["support_url"]))
+        if s["web_page_url"]:
+            self.send_header("Profile-Web-Page-Url", str(s["web_page_url"]))
         self.end_headers()
         if not head_only:
             self.wfile.write(body)
