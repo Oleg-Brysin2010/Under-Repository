@@ -6,7 +6,17 @@
 - если сообщение не ушло, повторяет попытку;
 - при смене названия или игры обновляет карточку;
 - когда стрим закончился, снимает закреп и превращает карточку в итог (сколько длился, пик зрителей);
-- пишет админам в личку, если нет подписанных чатов, Twitch долго не отвечает и т.п.
+- пишет админу в личку, если нет подписанных чатов, Twitch долго не отвечает и т.п.
+
+Версия 2.1 (всё работает и без ключей Twitch):
+- кнопка «Уведомлять меня» под карточкой: нажавших бот отмечает по имени в следующем уведомлении;
+- /last и /stats: когда был последний стрим, сколько длился, статистика за неделю и месяц;
+- настройки каждого чата: закреп, «без звука», ночной тихий режим (/settings);
+- при лимите запросов decapi.me (ошибка 429) бот сам реже спрашивает и меньше запросов делает.
+
+Версия 2.1.1:
+- если decapi.me не ответил на запрос названия, карточка не превращается в «Без названия»;
+- при смене названия или игры в карточке остаётся строка с отмеченными людьми.
 """
 import calendar
 import html
@@ -21,7 +31,7 @@ import urllib.parse
 import urllib.request
 from logging.handlers import RotatingFileHandler
 
-VERSION = "2.0"
+VERSION = "2.1.1"
 
 # ==================== НАСТРОЙКИ ====================
 # Все значения берутся из окружения (файл .env рядом с ботом)
@@ -50,6 +60,12 @@ NOTIFY_USERNAMES = {
 }
 NOTIFY_IDS = {x.strip() for x in os.environ.get("NOTIFY_IDS", "").split(",") if x.strip()}
 NOTIFY_FILE = os.environ.get("NOTIFY_FILE", "notify.json")
+MENTIONS_FILE = os.environ.get("MENTIONS_FILE", "mentions.json")  # кто нажал «Уведомлять меня»
+HISTORY_FILE = os.environ.get("HISTORY_FILE", "history.json")  # прошлые стримы
+CHAT_SETTINGS_FILE = os.environ.get("CHAT_SETTINGS_FILE", "chat_settings.json")  # настройки по чатам
+TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))  # часовой пояс для ночного режима и статистики (3 = Москва)
+DETAILS_TTL = int(os.environ.get("DETAILS_TTL", "180"))  # как часто в режиме без ключей перечитывать название, игру и зрителей
+MAX_MENTION_CHARS = 600  # сколько символов имён влезет в уведомление
 
 # Чаты, которые подписаны всегда (id через запятую). Необязательно.
 CHAT_IDS = [x.strip() for x in os.environ.get("CHAT_IDS", "").split(",") if x.strip()]
@@ -92,6 +108,10 @@ ADMINS_LOCK = threading.Lock()
 SUBS = {}  # id чата -> название
 LEARNED_IDS = set()
 LEARNED_NOTIFY = set()  # id людей из NOTIFY_USERNAMES, которых бот узнал
+MENTIONS = {}  # id чата -> {id пользователя: имя}: кого отмечать в уведомлении
+CHAT_SETTINGS = {}  # id чата -> {"pin": bool, "silent": bool, "night": [с, до] | None}
+HISTORY = []  # прошлые стримы
+DATA_LOCK = threading.Lock()
 STATE = {
     "is_live": False,
     "offline_since": None,
@@ -102,17 +122,22 @@ STATE = {
     "game": None,
     "messages": {},  # id чата -> {"id": id сообщения, "photo": bool}: карточки, которые отправили
     "retry": {},  # id чата -> сколько раз не получилось отправить
+    "games": [],  # во что играл за этот стрим
+    "rate_hits": 0,  # сколько проверок подряд упёрлись в лимит запросов
     "stream": None,
     "last_check": None,
     "last_error": None,
     "fail_count": 0,
     "alerted": False,
 }
-PERSIST_KEYS = ("is_live", "stream_id", "started_at", "peak", "title", "game", "messages", "retry")
+PERSIST_KEYS = ("is_live", "stream_id", "started_at", "peak", "title", "game", "messages", "retry", "games")
 
-ADMIN_COMMANDS = ("/start", "/stop", "/status", "/chats", "/test", "/say")
+ADMIN_COMMANDS = ("/start", "/stop", "/status", "/chats", "/test", "/say", "/pin", "/silent", "/night", "/settings")
 # русские варианты команд (в меню Telegram они не показываются, но работают, если их написать)
-ALIASES = {"/стрим": "/stream", "/статус": "/status", "/чаты": "/chats", "/тест": "/test"}
+ALIASES = {
+    "/стрим": "/stream", "/статус": "/status", "/чаты": "/chats", "/тест": "/test",
+    "/последний": "/last", "/статистика": "/stats", "/уведомлять": "/notify", "/настройки": "/settings",
+}
 
 ANON_BOT_ID = 1087968824  # служебный аккаунт GroupAnonymousBot: так Telegram показывает "анонимного админа"
 ANON_CACHE = {}  # chat_id -> (время проверки, результат)
@@ -264,6 +289,175 @@ def notify_admins(text):
         res = send_message(uid, text)
         if not (res and res.get("ok")):
             log.info("Не удалось написать %s (он ещё не нажимал /start у бота?)", uid)
+
+
+# ==================== ДАННЫЕ: «УВЕДОМЛЯТЬ МЕНЯ», НАСТРОЙКИ ЧАТОВ, ИСТОРИЯ ====================
+def _load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        log.warning("Не удалось прочитать %s: %s", path, e)
+        return default
+
+
+def _save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning("Не удалось сохранить %s: %s", path, e)
+
+
+def load_data():
+    mentions = _load_json(MENTIONS_FILE, {})
+    if isinstance(mentions, dict):
+        MENTIONS.update(
+            {str(c): {str(u): n for u, n in v.items()} for c, v in mentions.items() if isinstance(v, dict)}
+        )
+    settings = _load_json(CHAT_SETTINGS_FILE, {})
+    if isinstance(settings, dict):
+        CHAT_SETTINGS.update({str(c): v for c, v in settings.items() if isinstance(v, dict)})
+    history = _load_json(HISTORY_FILE, [])
+    if isinstance(history, list):
+        HISTORY.extend(x for x in history if isinstance(x, dict) and "ended" in x and "duration" in x)
+
+
+def toggle_mention(chat_id, user):
+    """Возвращает True, если человека добавили в список «уведомлять», и False, если убрали."""
+    cid, uid = str(chat_id), str(user["id"])
+    name = user.get("first_name") or user.get("username") or "друг"
+    with DATA_LOCK:
+        users = MENTIONS.setdefault(cid, {})
+        if uid in users:
+            users.pop(uid)
+            added = False
+        else:
+            users[uid] = name
+            added = True
+        _save_json(MENTIONS_FILE, MENTIONS)
+    return added
+
+
+def mention_line(chat_id):
+    """Строка с именами тех, кто нажал «Уведомлять меня» (в группе они получат отдельное уведомление)."""
+    with DATA_LOCK:
+        users = dict(MENTIONS.get(str(chat_id), {}))
+    parts, used = [], 0
+    for uid, name in users.items():
+        if used + len(name) > MAX_MENTION_CHARS:
+            break
+        parts.append(f'<a href="tg://user?id={uid}">{esc(name)}</a>')
+        used += len(name) + 2
+    return ("🔔 " + ", ".join(parts)) if parts else ""
+
+
+def chat_setting(chat_id, key):
+    defaults = {"pin": PIN_ANNOUNCE, "silent": False, "night": None}
+    with DATA_LOCK:
+        return CHAT_SETTINGS.get(str(chat_id), {}).get(key, defaults[key])
+
+
+def set_chat_setting(chat_id, key, value):
+    with DATA_LOCK:
+        CHAT_SETTINGS.setdefault(str(chat_id), {})[key] = value
+        _save_json(CHAT_SETTINGS_FILE, CHAT_SETTINGS)
+
+
+def local_hour():
+    return int((int(time.time()) // 3600 + TZ_OFFSET_HOURS) % 24)
+
+
+def is_silent(chat_id):
+    """Уведомление без звука: если так включено в чате или сейчас ночной тихий режим."""
+    if chat_setting(chat_id, "silent"):
+        return True
+    night = chat_setting(chat_id, "night")
+    if not night:
+        return False
+    start, end = night
+    hour = local_hour()
+    return (start <= hour < end) if start < end else (hour >= start or hour < end)
+
+
+def settings_text(chat_id):
+    night = chat_setting(chat_id, "night")
+    night_text = f"{night[0]:02d}:00–{night[1]:02d}:00" if night else "выкл"
+    with DATA_LOCK:
+        people = len(MENTIONS.get(str(chat_id), {}))
+    return (
+        "⚙️ <b>Настройки этого чата</b>\n\n"
+        f"• Закреп уведомления: {'вкл' if chat_setting(chat_id, 'pin') else 'выкл'} (<code>/pin on</code> или <code>/pin off</code>)\n"
+        f"• Всегда без звука: {'да' if chat_setting(chat_id, 'silent') else 'нет'} (<code>/silent on</code> или <code>/silent off</code>)\n"
+        f"• Ночной тихий режим: {night_text} (<code>/night 23-9</code> или <code>/night off</code>)\n"
+        f"• Нажали «Уведомлять меня»: {people}\n\n"
+        f"Время для ночного режима: UTC{TZ_OFFSET_HOURS:+d}."
+    )
+
+
+def fmt_ago(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return f"{seconds // 60} мин назад"
+    if seconds < 86400:
+        return f"{seconds // 3600} ч назад"
+    return f"{seconds // 86400} дн назад"
+
+
+def record_stream(started, ended, peak, title, games):
+    """Запоминаем завершённый стрим для /last и /stats."""
+    entry = {
+        "started": started, "ended": ended, "duration": max(0, ended - started),
+        "peak": peak, "title": title, "games": games,
+    }
+    with DATA_LOCK:
+        HISTORY.append(entry)
+        del HISTORY[:-200]
+        _save_json(HISTORY_FILE, HISTORY)
+
+
+def last_text():
+    with DATA_LOCK:
+        last = HISTORY[-1] if HISTORY else None
+    if not last:
+        return "Пока нет данных о прошлых стримах: бот начал вести историю недавно."
+    text = f"🕓 <b>Последний стрим</b> закончился {fmt_ago(time.time() - last['ended'])}\n\n"
+    text += f"📺 {esc(last.get('title') or 'Без названия')}\n"
+    if last.get("games"):
+        text += f"🎮 {esc(', '.join(last['games']))}\n"
+    text += f"⏱ Длился: {fmt_uptime(last['duration'])}\n"
+    if last.get("peak"):
+        text += f"👀 Пик зрителей: {last['peak']}\n"
+    return text.rstrip()
+
+
+def stats_text():
+    with DATA_LOCK:
+        items = list(HISTORY)
+    if not items:
+        return "Пока нет данных: статистика копится с момента запуска версии 2.1."
+    now = time.time()
+    week = [x for x in items if now - x["ended"] <= 7 * 86400]
+    month = [x for x in items if now - x["ended"] <= 30 * 86400]
+    week_total = sum(x["duration"] for x in week)
+    month_total = sum(x["duration"] for x in month)
+    text = "📊 <b>Статистика стримов</b>\n\n"
+    text += f"• За 7 дней: {len(week)} шт., всего {fmt_uptime(week_total)}\n"
+    text += f"• За 30 дней: {len(month)} шт., всего {fmt_uptime(month_total)}"
+    if month:
+        text += f", в среднем {fmt_uptime(month_total / len(month))}"
+    hours = [int((int(x["started"]) // 3600 + TZ_OFFSET_HOURS) % 24) for x in items if x.get("started")]
+    if hours:
+        common = max(set(hours), key=hours.count)
+        text += f"\n• Чаще всего начинает около {common:02d}:00 (UTC{TZ_OFFSET_HOURS:+d})"
+    longest = max(items, key=lambda x: x["duration"])
+    text += f"\n• Самый длинный: {fmt_uptime(longest['duration'])}"
+    best = max(items, key=lambda x: x.get("peak") or 0)
+    if best.get("peak"):
+        text += f"\n• Рекорд зрителей: {best['peak']}"
+    return text
 
 
 # ==================== ПОДПИСАННЫЕ ЧАТЫ ====================
@@ -419,6 +613,17 @@ def get_stream_official():
 # ==================== РЕЖИМ БЕЗ КЛЮЧЕЙ (публичный прокси decapi.me) ====================
 DECAPI = "https://decapi.me/twitch/"
 _TIME_WORDS = re.compile(r"\b(and|seconds?|minutes?|hours?|days?|weeks?|months?|years?)\b", re.I)
+RATE_MARK = "слишком много запросов"  # по этой фразе в ошибке понимаем, что упёрлись в лимит
+_DETAILS = {"ts": 0.0, "data": None}  # кэш названия, игры и зрителей (чтобы делать меньше запросов)
+_UPTIME_UNITS = {"second": 1, "minute": 60, "hour": 3600, "day": 86400, "week": 604800, "month": 2592000, "year": 31536000}
+
+
+def uptime_seconds(body):
+    """'1 hour, 5 minutes' -> число секунд."""
+    total = 0
+    for num, unit in re.findall(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?", body, re.I):
+        total += int(num) * _UPTIME_UNITS[unit.lower()]
+    return total
 
 
 def http_text(url, timeout=15):
@@ -438,10 +643,15 @@ def get_stream_public():
     Возвращает (stream | None если оффлайн, ошибка). Сервис неофициальный, без гарантий."""
     login = urllib.parse.quote(TWITCH_LOGIN)
     status, body, err = http_text(f"{DECAPI}uptime/{login}")
+    if "429" in (err or ""):
+        return None, f"decapi.me: {RATE_MARK} (429)"
     if err or not body:
         return None, f"decapi.me недоступен: {err or 'пустой ответ'}"
     low = body.lower()
+    if "429" in low or "too many" in low:
+        return None, f"decapi.me: {RATE_MARK} (429)"
     if "offline" in low:
+        _DETAILS["data"] = None  # в следующий раз название и игру прочитаем заново
         return None, None
     # Если стрим идёт, сервис отвечает только временем: "1 hour, 5 minutes"
     leftover = re.sub(r"[\d\s,]", "", _TIME_WORDS.sub("", body))
@@ -450,20 +660,35 @@ def get_stream_public():
 
     def fetch(endpoint):
         st, text, e = http_text(f"{DECAPI}{endpoint}/{login}")
-        return text if (not e and text) else None
+        if e or not text or text.startswith("[Error from"):  # decapi кладёт текст ошибки прямо в ответ
+            return None
+        return text
 
-    title = fetch("title") or "Без названия"
-    game = fetch("game")
-    viewers = fetch("viewercount")
-    try:
-        viewer_count = int(viewers) if viewers is not None else None
-    except ValueError:
-        viewer_count = None
+    now = time.time()
+    if _DETAILS["data"] and now - _DETAILS["ts"] < DETAILS_TTL:
+        title, game, viewer_count = _DETAILS["data"]
+    else:
+        title = fetch("title")
+        if title is None:
+            # decapi не ответил (429 и т.п.): оставляем прежнее и не кэшируем, повторим на следующей проверке
+            title = STATE["title"] or "Без названия"
+            game, viewer_count = STATE["game"], None
+        else:
+            game = fetch("game")
+            viewers = fetch("viewercount")
+            try:
+                viewer_count = int(viewers) if viewers is not None else None
+            except ValueError:
+                viewer_count = None
+            _DETAILS["ts"] = now
+            _DETAILS["data"] = (title, game, viewer_count)
+    uptime = uptime_seconds(body)
     return {
         "id": "public",
         "title": title,
         "game_name": game,
         "viewer_count": viewer_count,
+        "started_ts": (now - uptime) if uptime else None,
         "thumbnail_url": f"https://static-cdn.jtvnw.net/previews-ttv/live_user_{TWITCH_LOGIN}-{{width}}x{{height}}.jpg",
     }, None
 
@@ -499,7 +724,7 @@ def tg_api(method, payload=None, timeout=15):
     return None
 
 
-def send_message(chat_id, text, reply_markup=None):
+def send_message(chat_id, text, reply_markup=None, silent=False):
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -508,10 +733,12 @@ def send_message(chat_id, text, reply_markup=None):
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    if silent:
+        payload["disable_notification"] = True
     return tg_api("sendMessage", payload)
 
 
-def send_photo(chat_id, photo_url, caption, reply_markup=None):
+def send_photo(chat_id, photo_url, caption, reply_markup=None, silent=False):
     payload = {
         "chat_id": chat_id,
         "photo": photo_url,
@@ -520,6 +747,8 @@ def send_photo(chat_id, photo_url, caption, reply_markup=None):
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    if silent:
+        payload["disable_notification"] = True
     return tg_api("sendPhoto", payload, timeout=30)
 
 
@@ -547,9 +776,23 @@ def unpin_message(chat_id, message_id):
     tg_api("unpinChatMessage", {"chat_id": chat_id, "message_id": message_id})
 
 
+def answer_callback(callback_id, text=""):
+    tg_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+
 def setup_bot_commands():
-    # В общем меню — только безобидная команда; админские команды не светим
-    tg_api("setMyCommands", {"commands": [{"command": "stream", "description": "Идёт ли стрим сейчас"}]})
+    # В общем меню — только безобидные команды; админские не светим
+    tg_api(
+        "setMyCommands",
+        {
+            "commands": [
+                {"command": "stream", "description": "Идёт ли стрим сейчас"},
+                {"command": "last", "description": "Когда был последний стрим"},
+                {"command": "stats", "description": "Статистика стримов"},
+                {"command": "notify", "description": "Отмечать меня, когда начнётся стрим"},
+            ]
+        },
+    )
 
 
 def load_bot_username():
@@ -587,6 +830,13 @@ def stream_card(stream, header, viewers=True):
 
 def live_header():
     return f"🔴 <b>Стрим у {esc(STREAMER_NAME)}!</b>"
+
+
+def with_bell(kb, chat_id):
+    """В группах под карточкой добавляем кнопку «Уведомлять меня»."""
+    if str(chat_id).startswith("-"):
+        return {"inline_keyboard": kb["inline_keyboard"] + [[{"text": "🔔 Уведомлять меня", "callback_data": "notify"}]]}
+    return kb
 
 
 def ended_card(duration, peak):
@@ -689,27 +939,31 @@ def announce(stream, only_chats=None):
             )
         return
 
-    text, kb = stream_card(stream, live_header(), viewers=False)
+    base_text, base_kb = stream_card(stream, live_header(), viewers=False)
     photo = wait_preview(stream) if SEND_PREVIEW else None
     log.info("Рассылка уведомления в %d чат(ов)", len(chats))
     ok_count = 0
     for chat_id in chats:
         cid = str(chat_id)
+        mentions = mention_line(chat_id)  # те, кто нажал «Уведомлять меня»
+        text = base_text + (f"\n\n{mentions}" if mentions else "")
+        kb = with_bell(base_kb, chat_id)
+        silent = is_silent(chat_id)
         res = None
         is_photo = False
         if photo:
-            res = send_photo(chat_id, photo, text, kb)
+            res = send_photo(chat_id, photo, text, kb, silent)
             is_photo = bool(res and res.get("ok"))
         if not (res and res.get("ok")):  # нет превью или не получилось — шлём обычным текстом
-            res = send_message(chat_id, text, kb)
+            res = send_message(chat_id, text, kb, silent)
         ok = bool(res and res.get("ok"))
-        log.info("Уведомление в %s: %s", cid, "ок" if ok else "ошибка")
+        log.info("Уведомление в %s: %s%s", cid, "ок" if ok else "ошибка", " (без звука)" if silent else "")
         if ok:
             ok_count += 1
             msg_id = res["result"]["message_id"]
             STATE["messages"][cid] = {"id": msg_id, "photo": is_photo}
             STATE["retry"].pop(cid, None)
-            if PIN_ANNOUNCE:
+            if chat_setting(chat_id, "pin"):
                 pin_message(chat_id, msg_id)
         else:
             STATE["retry"][cid] = STATE["retry"].get(cid, 0) + 1
@@ -743,12 +997,15 @@ def refresh_cards(stream):
     game = stream.get("game_name")
     changed = title != STATE["title"] or game != STATE["game"]
     STATE["title"], STATE["game"] = title, game
+    if game and game not in STATE["games"]:
+        STATE["games"].append(game)
     if not changed:
         return
     if STATE["messages"]:
         text, kb = stream_card(stream, live_header(), viewers=False)
         for cid, info in STATE["messages"].items():
-            edit_card(cid, info, text, kb)
+            m = mention_line(cid)
+            edit_card(cid, info, text + (f"\n\n{m}" if m else ""), with_bell(kb, cid))
             time.sleep(0.1)
     save_state()
 
@@ -757,9 +1014,11 @@ def finish_stream():
     """Стрим закончился: снимаем закреп и превращаем карточки в итог."""
     end_ts = STATE["offline_since"] or time.time()
     duration = (end_ts - STATE["started_at"]) if STATE["started_at"] else None
+    if STATE["started_at"]:
+        record_stream(STATE["started_at"], end_ts, STATE["peak"], STATE["title"], list(STATE["games"]))
     text, kb = ended_card(duration, STATE["peak"])
     for cid, info in STATE["messages"].items():
-        if PIN_ANNOUNCE:
+        if chat_setting(cid, "pin"):
             unpin_message(cid, info["id"])
         if EDIT_ON_END:
             edit_card(cid, info, text, kb)
@@ -782,6 +1041,8 @@ def load_state():
         if not isinstance(STATE["retry"], dict):
             STATE["retry"] = {}
         STATE["peak"] = STATE["peak"] or 0
+        if not isinstance(STATE["games"], list):
+            STATE["games"] = []
         return True
     except FileNotFoundError:
         return False
@@ -801,12 +1062,14 @@ def save_state():
 def reset_stream_state():
     STATE.update(
         is_live=False, offline_since=None, stream_id=None, started_at=None,
-        peak=0, title=None, game=None, messages={}, retry={},
+        peak=0, title=None, game=None, messages={}, retry={}, games=[],
     )
 
 
 def parse_started(stream):
     """Время начала стрима из ответа Twitch (в режиме без ключей его нет)."""
+    if stream.get("started_ts"):  # режим без ключей: считаем по аптайму
+        return stream["started_ts"]
     s = stream.get("started_at")
     if not s:
         return None
@@ -830,6 +1093,8 @@ def run_check():
         if err:
             log.warning("Ошибка проверки: %s", err)
             STATE["fail_count"] += 1
+            # при лимите запросов бот притормаживает (см. next_delay)
+            STATE["rate_hits"] = STATE["rate_hits"] + 1 if RATE_MARK in err else 0
             # Если Twitch (или decapi.me) долго недоступен — сообщаем админам один раз
             if STATE["fail_count"] >= ALERT_AFTER and not STATE["alerted"]:
                 STATE["alerted"] = True
@@ -842,6 +1107,7 @@ def run_check():
         if STATE["alerted"]:
             notify_admins("✅ Связь с Twitch восстановлена.")
         STATE["fail_count"] = 0
+        STATE["rate_hits"] = 0
         STATE["alerted"] = False
         STATE["stream"] = stream
 
@@ -855,6 +1121,7 @@ def run_check():
                 STATE["peak"] = stream.get("viewer_count") or 0
                 STATE["title"] = stream.get("title") or "Без названия"
                 STATE["game"] = stream.get("game_name")
+                STATE["games"] = [STATE["game"]] if STATE["game"] else []
                 save_state()
                 if FIRST_RUN["baseline"]:
                     # первый запуск без файла состояния: стрим уже идёт — не спамим, просто запоминаем
@@ -884,6 +1151,14 @@ def run_check():
         return stream, None
 
 
+def next_delay():
+    """Пауза до следующей проверки. Если сервис проверки ограничивает запросы (429), ждём всё дольше."""
+    hits = STATE["rate_hits"]
+    if not hits:
+        return CHECK_INTERVAL
+    return min(CHECK_INTERVAL * 2 ** min(hits, 3), 300)
+
+
 def monitor_thread():
     log.info("Слежу за %s (каждые %d с), подписанных чатов: %d", STREAM_URL, CHECK_INTERVAL, len(subscribers()))
     while True:
@@ -891,7 +1166,7 @@ def monitor_thread():
             run_check()
         except Exception:
             log.exception("Ошибка в мониторинге")
-        time.sleep(CHECK_INTERVAL)
+        time.sleep(next_delay())
 
 
 # ==================== КОМАНДЫ АДМИНОВ ====================
@@ -921,6 +1196,8 @@ def cmd_status():
     )
     if STATE["last_error"]:
         text += f"\n• <b>Последняя ошибка:</b> <code>{esc(STATE['last_error'])}</code>"
+    if STATE["rate_hits"]:
+        text += f"\n• <b>Замедление:</b> сервис проверки ограничивает запросы, следующая проверка через {next_delay()} с"
     return text
 
 
@@ -938,8 +1215,11 @@ def cmd_test(chat_id):
         "game_name": "Just Chatting",
     }
     text, kb = stream_card(fake, live_header(), viewers=False)
+    mentions = mention_line(chat_id)
+    if mentions:
+        text += f"\n\n{mentions}"
     send_message(chat_id, "🧪 <i>Это тест, реального стрима нет:</i>")
-    send_message(chat_id, text, kb)
+    send_message(chat_id, text, with_bell(kb, chat_id), is_silent(chat_id))
 
 
 # ==================== ОБРАБОТКА ОБНОВЛЕНИЙ ====================
@@ -1007,7 +1287,7 @@ def handle_message(msg):
     title = chat_title(chat)
 
     # --- Доступ ---
-    if cmd in ("/stream", "/id"):
+    if cmd in ("/stream", "/id", "/last", "/stats", "/notify"):
         if not (admin or subscribed):
             log.warning("Игнорирую %s от %s в неподписанном чате %s", cmd, who(user), chat_id)
             return
@@ -1027,24 +1307,47 @@ def handle_message(msg):
     elif cmd == "/stream":
         # недавний результат берём из кэша, чтобы много чатов не долбили Twitch
         fresh = STATE["last_check"] and time.time() - STATE["last_check"] < 20 and not STATE["last_error"]
+        # при лимите запросов не долбим сервис ещё и командами
+        cooling = STATE["rate_hits"] and STATE["last_check"] and time.time() - STATE["last_check"] < 60
         if fresh:
             stream, err = STATE["stream"], None
+        elif cooling:
+            stream, err = None, STATE["last_error"]
         else:
             stream, err = run_check()
         if err:
             send_message(chat_id, f"⚠️ Не удалось проверить Twitch: <code>{esc(err)}</code>")
         elif stream:
             t, kb = stream_card(stream, f"🔴 <b>Сейчас стрим у {esc(STREAMER_NAME)}!</b>")
-            send_message(chat_id, t, kb)
+            send_message(chat_id, t, with_bell(kb, chat_id))
         else:
             kb = {"inline_keyboard": [[{"text": "🌐 Открыть канал", "url": STREAM_URL}]]}
-            send_message(chat_id, f"⚫ У {esc(STREAMER_NAME)} сейчас оффлайн.", kb)
+            msg_text = f"⚫ У {esc(STREAMER_NAME)} сейчас оффлайн."
+            if HISTORY:
+                msg_text += "\n\n" + last_text()
+            send_message(chat_id, msg_text, with_bell(kb, chat_id))
         if not subscribed:
             send_message(
                 chat_id,
                 "⚠️ Этот чат <b>не подписан</b> на автоуведомления, поэтому о начале стрима бот тут не напишет. "
                 "Чтобы включить, отправь /start",
             )
+
+    elif cmd == "/last":
+        send_message(chat_id, last_text())
+
+    elif cmd == "/stats":
+        send_message(chat_id, stats_text())
+
+    elif cmd == "/notify":
+        if not subscribed:
+            send_message(chat_id, "Этот чат не подписан на уведомления. Админ может включить: /start")
+        elif not user or is_anonymous_user(user) or anon_sender:
+            send_message(chat_id, "Не вижу, кто ты: отключи анонимность админа и повтори команду.")
+        elif toggle_mention(chat_id, user):
+            send_message(chat_id, "🔔 Буду отмечать тебя, когда начнётся стрим. Отключить: /notify")
+        else:
+            send_message(chat_id, "🔕 Больше не буду отмечать тебя. Включить обратно: /notify")
 
     # --- Команды только для админов ---
     elif cmd == "/start":
@@ -1066,6 +1369,30 @@ def handle_message(msg):
     elif cmd == "/test":
         cmd_test(chat_id)
 
+    elif cmd == "/settings":
+        send_message(chat_id, settings_text(chat_id))
+
+    elif cmd in ("/pin", "/silent"):
+        arg = parts[1].lower() if len(parts) > 1 else ""
+        if arg not in ("on", "off", "вкл", "выкл"):
+            send_message(chat_id, f"Напиши <code>{cmd} on</code> или <code>{cmd} off</code>")
+            return
+        set_chat_setting(chat_id, cmd[1:], arg in ("on", "вкл"))
+        send_message(chat_id, settings_text(chat_id))
+
+    elif cmd == "/night":
+        arg = parts[1].lower() if len(parts) > 1 else ""
+        if arg in ("off", "выкл"):
+            set_chat_setting(chat_id, "night", None)
+            send_message(chat_id, settings_text(chat_id))
+            return
+        match = re.fullmatch(r"(\d{1,2})-(\d{1,2})", arg)
+        if not match or int(match.group(1)) > 23 or int(match.group(2)) > 23 or match.group(1) == match.group(2):
+            send_message(chat_id, "Напиши часы, например <code>/night 23-9</code> (с 23:00 до 9:00), или <code>/night off</code>")
+            return
+        set_chat_setting(chat_id, "night", [int(match.group(1)), int(match.group(2))])
+        send_message(chat_id, settings_text(chat_id))
+
     elif cmd == "/say":
         body = text.split(None, 1)
         if len(body) < 2:
@@ -1076,11 +1403,29 @@ def handle_message(msg):
         send_message(chat_id, f"📣 Отправлено в {ok_count} чат(ов), ошибок: {fail_count}.")
 
 
+def handle_callback(cb):
+    """Нажатие на кнопку «Уведомлять меня» под карточкой."""
+    user = cb.get("from")
+    chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
+    if cb.get("data") != "notify" or chat_id is None or not user:
+        answer_callback(cb["id"])
+        return
+    if not is_subscribed(chat_id):
+        answer_callback(cb["id"], "Этот чат не подписан на уведомления")
+        return
+    if toggle_mention(chat_id, user):
+        answer_callback(cb["id"], "🔔 Буду отмечать тебя, когда начнётся стрим")
+    else:
+        answer_callback(cb["id"], "🔕 Больше не буду отмечать")
+
+
 def handle_update(update):
     if "my_chat_member" in update:
         handle_membership(update["my_chat_member"])
     elif "message" in update:
         handle_message(update["message"])
+    elif "callback_query" in update:
+        handle_callback(update["callback_query"])
 
 
 def telegram_polling():
@@ -1090,7 +1435,7 @@ def telegram_polling():
     while True:
         res = tg_api(
             "getUpdates",
-            {"offset": offset, "timeout": 30, "allowed_updates": ["message", "my_chat_member"]},
+            {"offset": offset, "timeout": 30, "allowed_updates": ["message", "my_chat_member", "callback_query"]},
             timeout=40,
         )
         if res and res.get("ok"):
@@ -1118,6 +1463,7 @@ if __name__ == "__main__":
 
     load_admins()
     load_chats()
+    load_data()
     FIRST_RUN["baseline"] = not load_state()
     load_bot_username()
     log.info("Админы: usernames=%s, ids=%s", sorted(ADMIN_USERNAMES), admin_ids())
