@@ -1,3 +1,14 @@
+"""Telegram-бот, который следит за стримом на Twitch и сам пишет в группы, когда стрим начался.
+
+Что умеет (версия 2):
+- сам присылает карточку в подписанные чаты в момент начала стрима (с превью и кнопкой);
+- закрепляет её в группе (если у бота есть право закреплять), чтобы было заметно;
+- если сообщение не ушло, повторяет попытку;
+- при смене названия или игры обновляет карточку;
+- когда стрим закончился, снимает закреп и превращает карточку в итог (сколько длился, пик зрителей);
+- пишет админам в личку, если нет подписанных чатов, Twitch долго не отвечает и т.п.
+"""
+import calendar
 import html
 import json
 import logging
@@ -9,6 +20,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from logging.handlers import RotatingFileHandler
+
+VERSION = "2.0"
 
 # ==================== НАСТРОЙКИ ====================
 # Все значения берутся из окружения (файл .env рядом с ботом)
@@ -28,13 +41,39 @@ ADMIN_USERNAMES = {
 }
 ADMIN_IDS = {x.strip() for x in os.environ.get("ADMIN_IDS", "5399489280").split(",") if x.strip()}
 
+# Кому бот пишет в личку (ошибки, «Twitch не отвечает», сообщение о запуске). Только этим людям,
+# остальные админы получают лишь право управлять ботом. Бот узнаёт id, когда человек напишет ему /start в личке.
+NOTIFY_USERNAMES = {
+    x.strip().lstrip("@").lower()
+    for x in os.environ.get("NOTIFY_USERNAMES", "ghchjfjtfh").split(",")
+    if x.strip()
+}
+NOTIFY_IDS = {x.strip() for x in os.environ.get("NOTIFY_IDS", "").split(",") if x.strip()}
+NOTIFY_FILE = os.environ.get("NOTIFY_FILE", "notify.json")
+
 # Чаты, которые подписаны всегда (id через запятую). Необязательно.
 CHAT_IDS = [x.strip() for x in os.environ.get("CHAT_IDS", "").split(",") if x.strip()]
 
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))  # как часто опрашивать Twitch (сек)
-OFFLINE_GRACE = int(os.environ.get("OFFLINE_GRACE", "5"))  # проверок подряд "оффлайн", чтобы считать стрим завершённым
+
+def keys_configured():
+    return bool(
+        TWITCH_CLIENT_ID
+        and TWITCH_CLIENT_SECRET
+        and TWITCH_CLIENT_ID != "temp"
+        and TWITCH_CLIENT_SECRET != "temp"
+    )
+
+
+# как часто опрашивать Twitch (сек): с официальным API можно чаще, через decapi.me — аккуратнее
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL") or (30 if keys_configured() else 60))
+OFFLINE_GRACE_SEC = int(os.environ.get("OFFLINE_GRACE_SEC", "300"))  # сколько секунд "оффлайн" подряд, чтобы считать стрим завершённым
 ALERT_AFTER = int(os.environ.get("ALERT_AFTER", "10"))  # после скольких неудачных проверок подряд писать админам
 SEND_PREVIEW = os.environ.get("SEND_PREVIEW", "1") == "1"  # присылать картинку-превью стрима
+PREVIEW_WAIT = int(os.environ.get("PREVIEW_WAIT", "20"))  # сколько секунд ждать превью в начале стрима
+PIN_ANNOUNCE = os.environ.get("PIN_ANNOUNCE", "1") == "1"  # закреплять уведомление в группе
+EDIT_ON_END = os.environ.get("EDIT_ON_END", "1") == "1"  # после стрима превращать карточку в итог
+STARTUP_NOTICE = os.environ.get("STARTUP_NOTICE", "1") == "1"  # писать админам при запуске бота
+RETRY_LIMIT = int(os.environ.get("RETRY_LIMIT", "5"))  # сколько раз повторять отправку в чат, если не вышло
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")  # идёт ли стрим
 CHATS_FILE = os.environ.get("CHATS_FILE", "chats.json")  # подписанные чаты
 ADMINS_FILE = os.environ.get("ADMINS_FILE", "admins.json")  # id админов, которых бот узнал по username
@@ -52,18 +91,28 @@ SUBS_LOCK = threading.Lock()
 ADMINS_LOCK = threading.Lock()
 SUBS = {}  # id чата -> название
 LEARNED_IDS = set()
+LEARNED_NOTIFY = set()  # id людей из NOTIFY_USERNAMES, которых бот узнал
 STATE = {
     "is_live": False,
-    "offline_count": 0,
+    "offline_since": None,
     "stream_id": None,
+    "started_at": None,  # когда начался стрим (unix)
+    "peak": 0,  # пик зрителей
+    "title": None,
+    "game": None,
+    "messages": {},  # id чата -> {"id": id сообщения, "photo": bool}: карточки, которые отправили
+    "retry": {},  # id чата -> сколько раз не получилось отправить
     "stream": None,
     "last_check": None,
     "last_error": None,
     "fail_count": 0,
     "alerted": False,
 }
+PERSIST_KEYS = ("is_live", "stream_id", "started_at", "peak", "title", "game", "messages", "retry")
 
 ADMIN_COMMANDS = ("/start", "/stop", "/status", "/chats", "/test", "/say")
+# русские варианты команд (в меню Telegram они не показываются, но работают, если их написать)
+ALIASES = {"/стрим": "/stream", "/статус": "/status", "/чаты": "/chats", "/тест": "/test"}
 
 ANON_BOT_ID = 1087968824  # служебный аккаунт GroupAnonymousBot: так Telegram показывает "анонимного админа"
 ANON_CACHE = {}  # chat_id -> (время проверки, результат)
@@ -94,6 +143,33 @@ def load_admins():
         pass
     except Exception as e:
         log.warning("Не удалось прочитать %s: %s", ADMINS_FILE, e)
+    try:
+        with open(NOTIFY_FILE, encoding="utf-8") as f:
+            LEARNED_NOTIFY.update(str(x) for x in json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Не удалось прочитать %s: %s", NOTIFY_FILE, e)
+
+
+def learn_notify(user_id):
+    """Запоминаем id человека, которому бот должен писать в личку."""
+    with ADMINS_LOCK:
+        uid = str(user_id)
+        if uid in LEARNED_NOTIFY or uid in NOTIFY_IDS:
+            return
+        LEARNED_NOTIFY.add(uid)
+        try:
+            with open(NOTIFY_FILE, "w", encoding="utf-8") as f:
+                json.dump(sorted(LEARNED_NOTIFY), f)
+        except Exception as e:
+            log.warning("Не удалось сохранить %s: %s", NOTIFY_FILE, e)
+    log.info("Буду писать в личку: id=%s", uid)
+
+
+def notify_ids():
+    with ADMINS_LOCK:
+        return sorted(NOTIFY_IDS | LEARNED_NOTIFY)
 
 
 def learn_admin(user_id):
@@ -116,9 +192,11 @@ def is_admin(user):
     if not user or user.get("is_bot"):
         return False
     uid = str(user.get("id"))
+    uname = (user.get("username") or "").lower()
+    if uname and uname in NOTIFY_USERNAMES:
+        learn_notify(uid)
     if uid in ADMIN_IDS or uid in LEARNED_IDS:
         return True
-    uname = (user.get("username") or "").lower()
     if uname and uname in ADMIN_USERNAMES:
         learn_admin(uid)
         return True
@@ -176,11 +254,16 @@ def who(user):
 
 
 def notify_admins(text):
-    """Личное сообщение всем известным админам (они должны хотя бы раз нажать /start у бота в личке)."""
-    for uid in admin_ids():
+    """Личное сообщение только тем, кто указан в NOTIFY_USERNAMES / NOTIFY_IDS
+    (человек должен хотя бы раз нажать /start у бота в личке, иначе Telegram не даст боту написать первым)."""
+    ids = notify_ids()
+    if not ids:
+        log.warning("Некому писать в личку: напиши боту /start с аккаунта @%s", ", @".join(sorted(NOTIFY_USERNAMES)))
+        return
+    for uid in ids:
         res = send_message(uid, text)
         if not (res and res.get("ok")):
-            log.info("Не удалось написать админу %s (он ещё не нажимал /start у бота?)", uid)
+            log.info("Не удалось написать %s (он ещё не нажимал /start у бота?)", uid)
 
 
 # ==================== ПОДПИСАННЫЕ ЧАТЫ ====================
@@ -282,15 +365,6 @@ def http_json(url, data=None, headers=None, timeout=15):
 
 
 # ==================== TWITCH API ====================
-def keys_configured():
-    return bool(
-        TWITCH_CLIENT_ID
-        and TWITCH_CLIENT_SECRET
-        and TWITCH_CLIENT_ID != "temp"
-        and TWITCH_CLIENT_SECRET != "temp"
-    )
-
-
 def twitch_token(force=False):
     """App access token (client credentials), кэшируется до истечения."""
     with TOKEN_LOCK:
@@ -449,6 +523,30 @@ def send_photo(chat_id, photo_url, caption, reply_markup=None):
     return tg_api("sendPhoto", payload, timeout=30)
 
 
+def edit_card(chat_id, info, text, kb=None):
+    """Меняет текст ранее отправленной карточки (с картинкой или без)."""
+    payload = {"chat_id": chat_id, "message_id": info["id"], "parse_mode": "HTML"}
+    if kb:
+        payload["reply_markup"] = kb
+    if info.get("photo"):
+        payload["caption"] = text
+        return tg_api("editMessageCaption", payload)
+    payload["text"] = text
+    payload["disable_web_page_preview"] = True
+    return tg_api("editMessageText", payload)
+
+
+def pin_message(chat_id, message_id):
+    """Закрепляет сообщение без лишнего уведомления (оно и так заметное). Нужно право «Закреплять сообщения»."""
+    res = tg_api("pinChatMessage", {"chat_id": chat_id, "message_id": message_id, "disable_notification": True})
+    if not (res and res.get("ok")):
+        log.info("Не удалось закрепить сообщение в %s (у бота нет права закреплять?)", chat_id)
+
+
+def unpin_message(chat_id, message_id):
+    tg_api("unpinChatMessage", {"chat_id": chat_id, "message_id": message_id})
+
+
 def setup_bot_commands():
     # В общем меню — только безобидная команда; админские команды не светим
     tg_api("setMyCommands", {"commands": [{"command": "stream", "description": "Идёт ли стрим сейчас"}]})
@@ -474,16 +572,35 @@ def fmt_uptime(seconds):
     return f"{d}д {h}ч {m}м" if d else f"{h}ч {m}м"
 
 
-def stream_card(stream, header):
+def stream_card(stream, header, viewers=True):
     title = stream.get("title") or "Без названия"
     game = stream.get("game_name")
     text = f"{header}\n\n📺 <b>{esc(title)}</b>\n"
     if game:
         text += f"🎮 {esc(game)}\n"
-    if stream.get("viewer_count") is not None:
+    if viewers and stream.get("viewer_count") is not None:
         text += f"👀 Зрителей: {stream['viewer_count']}\n"
     text += f"\n👉 {STREAM_URL}"
     kb = {"inline_keyboard": [[{"text": "▶️ Смотреть стрим", "url": STREAM_URL}]]}
+    return text, kb
+
+
+def live_header():
+    return f"🔴 <b>Стрим у {esc(STREAMER_NAME)}!</b>"
+
+
+def ended_card(duration, peak):
+    title = STATE.get("title") or "Без названия"
+    game = STATE.get("game")
+    text = f"⚫ <b>Стрим у {esc(STREAMER_NAME)} закончился</b>\n\n📺 {esc(title)}\n"
+    if game:
+        text += f"🎮 {esc(game)}\n"
+    if duration and duration > 0:
+        text += f"⏱ Длился: {fmt_uptime(duration)}\n"
+    if peak:
+        text += f"👀 Пик зрителей: {peak}\n"
+    text += "\nДо следующего стрима 👋"
+    kb = {"inline_keyboard": [[{"text": "🌐 Открыть канал", "url": STREAM_URL}]]}
     return text, kb
 
 
@@ -493,6 +610,34 @@ def preview_url(stream):
         return None
     thumb = thumb.replace("{width}", "1280").replace("{height}", "720")
     return f"{thumb}?t={int(time.time())}"  # cache-buster, чтобы Telegram не взял старую картинку
+
+
+def preview_ready(url):
+    """В первые секунды стрима Twitch отдаёт заглушку «нет превью». Проверяем, что картинка настоящая."""
+    req = urllib.request.Request(url, headers={"User-Agent": "twitch-telegram-bot"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            return "404_preview" not in resp.geturl() and ctype.startswith("image")
+    except urllib.error.HTTPError:
+        return False
+    except Exception:
+        return True  # проверить не вышло — пусть попробует сам Telegram, в крайнем случае уйдёт текст
+
+
+def wait_preview(stream):
+    """Возвращает ссылку на готовое превью или None, если за PREVIEW_WAIT секунд оно не появилось."""
+    url = preview_url(stream)
+    if not url:
+        return None
+    deadline = time.time() + PREVIEW_WAIT
+    while True:
+        if preview_ready(url):
+            return url
+        if time.time() >= deadline:
+            log.info("Превью стрима пока нет, отправляю без картинки")
+            return None
+        time.sleep(5)
 
 
 def greeting_text():
@@ -531,23 +676,95 @@ def broadcast_text(text):
     return ok_count, fail_count
 
 
-def announce(stream):
-    text, kb = stream_card(stream, f"🔴 <b>Стрим у {esc(STREAMER_NAME)}!</b>")
-    chats = subscribers()
+def announce(stream, only_chats=None):
+    """Рассылает карточку «Стрим начался». only_chats — повторная отправка только в эти чаты."""
+    first_try = only_chats is None
+    chats = subscribers() if first_try else list(only_chats)
+    if not chats:
+        log.warning("Стрим начался, но нет подписанных чатов")
+        if first_try:
+            notify_admins(
+                f"⚠️ Стрим у {esc(STREAMER_NAME)} начался, но ни один чат не подписан на уведомления.\n"
+                "Зайди в нужную группу и отправь там /start (от админа бота)."
+            )
+        return
+
+    text, kb = stream_card(stream, live_header(), viewers=False)
+    photo = wait_preview(stream) if SEND_PREVIEW else None
     log.info("Рассылка уведомления в %d чат(ов)", len(chats))
+    ok_count = 0
     for chat_id in chats:
+        cid = str(chat_id)
         res = None
-        if SEND_PREVIEW:
-            url = preview_url(stream)
-            if url:
-                res = send_photo(chat_id, url, text, kb)
+        is_photo = False
+        if photo:
+            res = send_photo(chat_id, photo, text, kb)
+            is_photo = bool(res and res.get("ok"))
         if not (res and res.get("ok")):  # нет превью или не получилось — шлём обычным текстом
             res = send_message(chat_id, text, kb)
         ok = bool(res and res.get("ok"))
-        log.info("Уведомление в %s: %s", chat_id, "ок" if ok else "ошибка")
-        if res and not ok:
-            handle_send_error(chat_id, res)
+        log.info("Уведомление в %s: %s", cid, "ок" if ok else "ошибка")
+        if ok:
+            ok_count += 1
+            msg_id = res["result"]["message_id"]
+            STATE["messages"][cid] = {"id": msg_id, "photo": is_photo}
+            STATE["retry"].pop(cid, None)
+            if PIN_ANNOUNCE:
+                pin_message(chat_id, msg_id)
+        else:
+            STATE["retry"][cid] = STATE["retry"].get(cid, 0) + 1
+            if res:
+                handle_send_error(chat_id, res)
         time.sleep(0.1)  # не упираемся в лимиты Telegram
+    save_state()
+    if first_try and ok_count == 0:
+        notify_admins(
+            f"⚠️ Стрим начался, но уведомление не ушло ни в один чат ({len(chats)}). "
+            "Проверь, что бот всё ещё в группах и может в них писать. Буду пробовать ещё."
+        )
+
+
+def retry_failed(stream):
+    """Повторяем отправку в чаты, куда с первого раза не дошло."""
+    pending = []
+    for cid, attempts in list(STATE["retry"].items()):
+        if not is_subscribed(cid) or attempts >= RETRY_LIMIT:
+            STATE["retry"].pop(cid, None)
+        else:
+            pending.append(cid)
+    if pending:
+        log.info("Повторная отправка уведомления в %d чат(ов)", len(pending))
+        announce(stream, only_chats=pending)
+
+
+def refresh_cards(stream):
+    """Название или игра сменились — обновляем уже отправленные карточки (без нового сообщения)."""
+    title = stream.get("title") or "Без названия"
+    game = stream.get("game_name")
+    changed = title != STATE["title"] or game != STATE["game"]
+    STATE["title"], STATE["game"] = title, game
+    if not changed:
+        return
+    if STATE["messages"]:
+        text, kb = stream_card(stream, live_header(), viewers=False)
+        for cid, info in STATE["messages"].items():
+            edit_card(cid, info, text, kb)
+            time.sleep(0.1)
+    save_state()
+
+
+def finish_stream():
+    """Стрим закончился: снимаем закреп и превращаем карточки в итог."""
+    end_ts = STATE["offline_since"] or time.time()
+    duration = (end_ts - STATE["started_at"]) if STATE["started_at"] else None
+    text, kb = ended_card(duration, STATE["peak"])
+    for cid, info in STATE["messages"].items():
+        if PIN_ANNOUNCE:
+            unpin_message(cid, info["id"])
+        if EDIT_ON_END:
+            edit_card(cid, info, text, kb)
+        time.sleep(0.1)
+    log.info("Итог стрима: длился %s, пик зрителей %s", fmt_uptime(duration) if duration else "?", STATE["peak"])
 
 
 # ==================== СОСТОЯНИЕ СТРИМА ====================
@@ -556,8 +773,15 @@ def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             saved = json.load(f)
-        STATE["is_live"] = bool(saved.get("is_live"))
-        STATE["stream_id"] = saved.get("stream_id")
+        for key in PERSIST_KEYS:
+            if key in saved:
+                STATE[key] = saved[key]
+        STATE["is_live"] = bool(STATE["is_live"])
+        if not isinstance(STATE["messages"], dict):
+            STATE["messages"] = {}
+        if not isinstance(STATE["retry"], dict):
+            STATE["retry"] = {}
+        STATE["peak"] = STATE["peak"] or 0
         return True
     except FileNotFoundError:
         return False
@@ -569,9 +793,27 @@ def load_state():
 def save_state():
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"is_live": STATE["is_live"], "stream_id": STATE["stream_id"]}, f)
+            json.dump({k: STATE[k] for k in PERSIST_KEYS}, f, ensure_ascii=False)
     except Exception as e:
         log.warning("Не удалось сохранить состояние: %s", e)
+
+
+def reset_stream_state():
+    STATE.update(
+        is_live=False, offline_since=None, stream_id=None, started_at=None,
+        peak=0, title=None, game=None, messages={}, retry={},
+    )
+
+
+def parse_started(stream):
+    """Время начала стрима из ответа Twitch (в режиме без ключей его нет)."""
+    s = stream.get("started_at")
+    if not s:
+        return None
+    try:
+        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return None
 
 
 # ==================== ПРОВЕРКА ====================
@@ -604,10 +846,15 @@ def run_check():
         STATE["stream"] = stream
 
         if stream:
-            STATE["offline_count"] = 0
+            STATE["offline_since"] = None
             if not STATE["is_live"]:
+                reset_stream_state()
                 STATE["is_live"] = True
                 STATE["stream_id"] = stream.get("id")
+                STATE["started_at"] = parse_started(stream) or time.time()
+                STATE["peak"] = stream.get("viewer_count") or 0
+                STATE["title"] = stream.get("title") or "Без названия"
+                STATE["game"] = stream.get("game_name")
                 save_state()
                 if FIRST_RUN["baseline"]:
                     # первый запуск без файла состояния: стрим уже идёт — не спамим, просто запоминаем
@@ -615,18 +862,25 @@ def run_check():
                 else:
                     log.info("Стрим начался: %s", stream.get("title"))
                     announce(stream)
+            else:
+                viewers = stream.get("viewer_count") or 0
+                if viewers > STATE["peak"]:
+                    STATE["peak"] = viewers
+                if STATE["retry"]:
+                    retry_failed(stream)
+                refresh_cards(stream)
             FIRST_RUN["baseline"] = False
         else:
             FIRST_RUN["baseline"] = False
             if STATE["is_live"]:
-                STATE["offline_count"] += 1
-                # ждём несколько проверок подряд, чтобы короткий обрыв связи не считался новым стримом
-                if STATE["offline_count"] >= OFFLINE_GRACE:
-                    STATE["is_live"] = False
-                    STATE["stream_id"] = None
-                    STATE["offline_count"] = 0
-                    save_state()
+                if STATE["offline_since"] is None:
+                    STATE["offline_since"] = time.time()
+                # ждём несколько минут, чтобы короткий обрыв связи не считался новым стримом
+                if time.time() - STATE["offline_since"] >= OFFLINE_GRACE_SEC:
                     log.info("Стрим завершён")
+                    finish_stream()
+                    reset_stream_state()
+                    save_state()
         return stream, None
 
 
@@ -655,12 +909,14 @@ def cmd_status():
     else:
         live = "🔴 идёт" if STATE["is_live"] else "⚫ оффлайн"
     text = (
-        f"{'🟡' if STATE['last_error'] else '🟢'} <b>Бот работает</b>\n\n"
+        f"{'🟡' if STATE['last_error'] else '🟢'} <b>Бот работает</b> (версия {VERSION})\n\n"
         f"• <b>Аптайм:</b> {fmt_uptime(time.time() - START_TIME)}\n"
         f"• <b>Канал:</b> {esc(TWITCH_LOGIN)} — {live}\n"
         f"• <b>Режим Twitch:</b> {keys}\n"
+        f"• <b>Проверка каждые:</b> {CHECK_INTERVAL} с\n"
         f"• <b>Последняя проверка:</b> {last}\n"
         f"• <b>Подписанных чатов:</b> {len(subscribers())}\n"
+        f"• <b>Закреп уведомления:</b> {'вкл' if PIN_ANNOUNCE else 'выкл'}\n"
         f"• <b>Админов известно:</b> {len(admin_ids())}"
     )
     if STATE["last_error"]:
@@ -671,7 +927,7 @@ def cmd_status():
 def cmd_chats():
     items = subscribed_with_titles()
     if not items:
-        return "Подписанных чатов нет."
+        return "Подписанных чатов нет. Отправь /start в нужной группе."
     lines = [f"• {esc(t or '(без названия)')} — <code>{cid}</code>" for cid, t in items.items()]
     return f"📋 <b>Подписанные чаты ({len(items)}):</b>\n\n" + "\n".join(lines)
 
@@ -680,9 +936,8 @@ def cmd_test(chat_id):
     fake = {
         "title": "Тестовый стрим — так будет выглядеть уведомление",
         "game_name": "Just Chatting",
-        "viewer_count": 123,
     }
-    text, kb = stream_card(fake, f"🔴 <b>Стрим у {esc(STREAMER_NAME)}!</b>")
+    text, kb = stream_card(fake, live_header(), viewers=False)
     send_message(chat_id, "🧪 <i>Это тест, реального стрима нет:</i>")
     send_message(chat_id, text, kb)
 
@@ -739,7 +994,7 @@ def handle_message(msg):
     if not parts or not parts[0].startswith("/"):
         return
     cmd, _, target = parts[0].partition("@")
-    cmd = cmd.lower()
+    cmd = ALIASES.get(cmd.lower(), cmd.lower())
     # команда адресована другому боту (/id@other_bot) — не отвечаем
     if target and BOT_USERNAME and target.lower() != BOT_USERNAME.lower():
         return
@@ -784,6 +1039,12 @@ def handle_message(msg):
         else:
             kb = {"inline_keyboard": [[{"text": "🌐 Открыть канал", "url": STREAM_URL}]]}
             send_message(chat_id, f"⚫ У {esc(STREAMER_NAME)} сейчас оффлайн.", kb)
+        if not subscribed:
+            send_message(
+                chat_id,
+                "⚠️ Этот чат <b>не подписан</b> на автоуведомления, поэтому о начале стрима бот тут не напишет. "
+                "Чтобы включить, отправь /start",
+            )
 
     # --- Команды только для админов ---
     elif cmd == "/start":
@@ -849,6 +1110,7 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
         log.error("Не задана переменная окружения BOT_TOKEN")
         raise SystemExit(1)
+    log.info("Версия бота: %s", VERSION)
     if keys_configured():
         log.info("Режим Twitch: официальный API")
     else:
@@ -859,6 +1121,12 @@ if __name__ == "__main__":
     FIRST_RUN["baseline"] = not load_state()
     load_bot_username()
     log.info("Админы: usernames=%s, ids=%s", sorted(ADMIN_USERNAMES), admin_ids())
+    if STARTUP_NOTICE:
+        n = len(subscribers())
+        note = f"🤖 Бот запущен (версия {VERSION}). Подписанных чатов: {n}."
+        if n == 0:
+            note += "\n⚠️ Ни один чат не подписан: отправь /start в нужной группе, иначе уведомлений о стриме не будет."
+        notify_admins(note)
     threading.Thread(target=monitor_thread, name="monitor", daemon=True).start()
     threading.current_thread().name = "telegram"
     telegram_polling()
