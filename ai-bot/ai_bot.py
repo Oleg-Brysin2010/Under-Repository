@@ -3,8 +3,10 @@ import io
 import re
 import json
 import base64
+import urllib.parse
 import tempfile
 import subprocess
+from datetime import datetime, timezone, timedelta
 import telebot
 from telebot import types
 import requests
@@ -15,161 +17,318 @@ try:
 except ImportError:
     HAS_PIL = False
 
-# Твои токены (разделены плюсом, чтобы защита GitHub не блокировала ключ)
+# Токены (разделены плюсом от автоблокировки GitHub)
 TELEGRAM_TOKEN = "8967141379:" + "AAFIy52g-Rz0ff73dFQaTn1t7PZ0xlU7Qjs"
 GROQ_API_KEY = "gsk_" + "7ZZ7rgRfeBzOIEnchdcyWGdyb3FYPeTrVNq4oew7RXzxiVfAmn20"
 
-BOT_VERSION = "3.1"
-MEMORY_FILE = "/root/ai-bot/memory.json"
+BOT_VERSION = "4.0"
+OLD_MEMORY_FILE = "/root/ai-bot/memory.json"
+
+# Удаляем старую память с упоминаниями сервера и режимов, чтобы бот больше не тупил
+if os.path.exists(OLD_MEMORY_FILE):
+    try:
+        os.remove(OLD_MEMORY_FILE)
+    except Exception:
+        pass
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-AVAILABLE_MODELS = []
-VISION_MODELS = []
-CURRENT_MODEL = None
+# Храним только короткую историю текущего диалога в оперативной памяти
+chat_histories = {}
 
-PREFERRED_MODELS = [
+# Одна лучшая основная модель + авторезерв на случай перегрузки
+MAIN_MODELS = [
     "openai/gpt-oss-120b",
-    "qwen/qwen3.8-27b",
     "llama-3.3-70b-versatile",
-    "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant"
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-20b"
 ]
 
-# Актуальные модели со зрением на Groq (Qwen 3.8 27B — главная мультимодальная модель)
-PREFERRED_VISION_MODELS = [
+VISION_MODELS = [
     "qwen/qwen3.8-27b",
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "meta-llama/llama-4-maverick-17b-128e-instruct"
 ]
 
-SKIP_KEYWORDS = ["whisper", "tts", "guard", "playai", "orpheus", "embed", "allam"]
+DAYS_RU = [
+    "понедельник", "вторник", "среда", "четверг",
+    "пятница", "суббота", "воскресенье"
+]
 
-MODES = {
-    "coder": (
-        "Ты личный ИИ-ассистент и опытный программист в Telegram (версия 3.1). "
-        "Ты работаешь на сервере своего создателя в Нидерландах и обновляешься напрямую с его GitHub. "
-        "Отвечай четко, подробно и по делу на русском языке. "
-        "Когда просят написать код — пиши полный, рабочий и чистый код без сокращений."
-    ),
-    "bro": (
-        "Ты лучший друг и ИИ-бро в Telegram (версия 3.1), живущий на сервере в Нидерландах. "
-        "Общайся живо, по-дружески, с хорошим юмором и приколами, поддерживай разговор, "
-        "эмоционально реагируй на стикеры, гифки и фото, но когда просят помочь с делом или кодом — помогай на высшем уровне."
-    ),
-    "expert": (
-        "Ты аналитический ИИ-эксперт и системный архитектор в Telegram (версия 3.1). "
-        "Давай максимально глубокие, точные и структурированные ответы, разбирай задачи по шагам."
-    )
-}
-
-MODE_NAMES = {
-    "coder": "💻 Программист и помощник",
-    "bro": "😎 Лучший друг (Бро)",
-    "expert": "🧠 Ультра-эксперт"
-}
-
-def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"histories": {}, "facts": {}, "modes": {}}
-
-def save_memory():
-    try:
-        os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(memory_data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Ошибка сохранения памяти: {e}")
-
-memory_data = load_memory()
-
-def fetch_working_models():
-    global AVAILABLE_MODELS, VISION_MODELS, CURRENT_MODEL
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    try:
-        resp = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json().get("data", [])
-            models = []
-            for m in data:
-                m_id = m.get("id", "")
-                if not any(skip in m_id.lower() for skip in SKIP_KEYWORDS):
-                    models.append(m_id)
-
-            sorted_models = [m for m in PREFERRED_MODELS if m in models]
-            for m in models:
-                if m not in sorted_models:
-                    sorted_models.append(m)
-
-            AVAILABLE_MODELS = sorted_models
-
-            # Собираем доступные модели со зрением
-            v_list = [m for m in PREFERRED_VISION_MODELS if m in models]
-            for m in models:
-                if any(k in m.lower() for k in ["qwen3.8", "vision", "llama-4"]) and m not in v_list:
-                    v_list.append(m)
-            VISION_MODELS = v_list if v_list else PREFERRED_VISION_MODELS
-
-            if AVAILABLE_MODELS and (CURRENT_MODEL not in AVAILABLE_MODELS):
-                CURRENT_MODEL = AVAILABLE_MODELS[0]
-    except Exception as e:
-        print(f"Ошибка получения списка моделей: {e}")
-
-fetch_working_models()
+def get_moscow_time_str():
+    msk_tz = timezone(timedelta(hours=3))
+    now = datetime.now(msk_tz)
+    day_name = DAYS_RU[now.weekday()]
+    return now.strftime(f"%d.%m.%Y ({day_name}), %H:%M:%S по московскому времени (МСК)")
 
 def get_keyboard():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row(types.KeyboardButton("🗑 Очистить память"), types.KeyboardButton("🤖 Модели ИИ"))
-    markup.row(types.KeyboardButton("👤 Обо мне"), types.KeyboardButton("🎭 Режим"))
+    markup.add(types.KeyboardButton("🗑 Очистить память"))
     return markup
 
 def build_system_prompt(user):
-    uid = str(user.id)
-    first_name = user.first_name or ""
-    last_name = user.last_name or ""
-    full_name = f"{first_name} {last_name}".strip() or "Друг"
-    username = f"@{user.username}" if user.username else "не указан"
-
-    mode_key = memory_data.get("modes", {}).get(uid, "coder")
-    base_prompt = MODES.get(mode_key, MODES["coder"])
-
-    user_facts = memory_data.get("facts", {}).get(uid, [])
-    facts_text = "\n".join([f"- {fact}" for fact in user_facts]) if user_facts else "Пока нет дополнительных заметок."
-
-    profile_block = (
-        f"\n\n[ДАННЫЕ О СОБЕСЕДНИКЕ В TELEGRAM]\n"
-        f"- Имя пользователя: {full_name}\n"
-        f"- Username: {username}\n"
-        f"- Telegram ID: {uid}\n"
-        f"- Сохранённые факты о пользователе:\n{facts_text}\n"
-        f"Обращайся к пользователю по имени ({first_name or full_name}), когда уместно, и помни эти факты!"
+    name = (user.first_name or "друг").strip()
+    msk_time = get_moscow_time_str()
+    return (
+        f"Ты умный, современный ИИ-помощник в Telegram.\n"
+        f"Сейчас разговариваешь с пользователем по имени: {name}.\n"
+        f"Текущее время и дата в Москве: {msk_time}.\n\n"
+        f"СТРОГИЕ ПРАВИЛА:\n"
+        f"1. НИКОГДА не пиши про серверы, Нидерланды, хостинг или GitHub.\n"
+        f"2. НИКОГДА не используй в тексте символы разметки: НЕ пиши решётки (#, ##, ###), "
+        f"НЕ пиши звёздочки (*, **), НЕ рисуй таблицы из вертикальных палок и тире (|---|---|), "
+        f"НЕ ставь знаки цитат (>) в начале строки. Пиши только чистым, красивым обычным текстом с абзацами. "
+        f"Для списков используй обычное тире (-) или цифры (1., 2.).\n"
+        f"3. Если в запросе переданы РЕЗУЛЬТАТЫ ПОИСКА ИЗ ИНТЕРНЕТА И YOUTUBE — опирайся строго на них, "
+        f"не выдумывай факты от себя и обязательно давай прямые ссылки (https://...), если они есть в результатах поиска.\n"
+        f"4. Если пользователь просит написать программный код — пиши полный, чистый рабочий код."
     )
-    return base_prompt + profile_block
 
-def clean_response(text):
-    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    return cleaned if cleaned else text
+def clean_formatting(text):
+    """Удаляет уродливые таблицы |---|, решётки ### и звёздочки **, сохраняя блоки кода."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-def get_user_history(user):
+    # Разделяем текст на обычный текст и блоки кода ```...```, чтобы не испортить код
+    parts = re.split(r"(```[\s\S]*?```)", text)
+    cleaned_parts = []
+
+    for part in parts:
+        if part.startswith("```") and part.endswith("```"):
+            # Убираем только тройные кавычки, оставляя сам код чистым
+            code_lines = part.strip("`").splitlines()
+            if code_lines and re.match(r"^[a-zA-Z0-9_+-]+$", code_lines[0].strip()):
+                code_lines = code_lines[1:]
+            cleaned_parts.append("\n".join(code_lines))
+            continue
+
+        # Превращаем ссылки вида [Текст](https://...) в Текст: https://...
+        part = re.sub(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)", r"\1 (\2)", part)
+
+        lines = part.splitlines()
+        new_lines = []
+        for line in lines:
+            # Удаляем строки-разделители таблиц вида |---|---| и горизонтальные линии ---
+            if re.match(r"^\s*\|[\s\-:|]+\|\s*$", line):
+                continue
+            if re.match(r"^\s*[\-*_]{3,}\s*$", line):
+                continue
+
+            # Если это строка таблицы | Ячейка 1 | Ячейка 2 | — превращаем в обычную строку
+            if line.strip().startswith("|") and line.strip().endswith("|"):
+                cells = [c.strip() for c in line.strip().strip("|").split("|") if c.strip()]
+                if cells:
+                    line = " — ".join(cells)
+                else:
+                    continue
+
+            # Убираем решётки заголовков (## Заголовок) и цитаты (>)
+            line = re.sub(r"^\s*#{1,6}\s*", "", line)
+            line = re.sub(r"^\s*>\s*", "", line)
+
+            # Заменяем маркеры списка "* Пункт" на "• Пункт"
+            line = re.sub(r"^\s*\*\s+", "• ", line)
+
+            # Убираем все звёздочки жирного/курсивного текста (** и *)
+            line = line.replace("**", "").replace("*", "")
+            line = line.replace("__", "")
+
+            new_lines.append(line)
+
+        cleaned_text = "\n".join(new_lines)
+        cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text)
+        cleaned_parts.append(cleaned_text)
+
+    return "\n".join(cleaned_parts).strip()
+
+# ================= ПОИСК В ИНТЕРНЕТЕ И YOUTUBE =================
+
+def search_duckduckgo(query, max_results=5):
+    results = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    try:
+        resp = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query, "kl": "ru-ru"},
+            headers=headers,
+            timeout=8
+        )
+        if resp.status_code == 200:
+            html = resp.text
+            blocks = re.findall(
+                r'<a rel="nofollow" class="result__a" href="([^"]+)">(.*?)</a>.*?<a class="result__snippet"[^>]*>(.*?)</a>',
+                html,
+                flags=re.DOTALL
+            )
+            for url, title, snippet in blocks[:max_results]:
+                clean_title = re.sub(r"<.*?>", "", title).strip()
+                clean_snip = re.sub(r"<.*?>", "", snippet).strip()
+                if "uddg=" in url:
+                    m = re.search(r"uddg=([^&]+)", url)
+                    if m:
+                        url = urllib.parse.unquote(m.group(1))
+                results.append(f"- {clean_title}: {clean_snip} (Ссылка: {url})")
+    except Exception:
+        pass
+    return results
+
+def search_wikipedia_ru(query):
+    results = []
+    headers = {"User-Agent": "TelegramAIBot/4.0"}
+    try:
+        params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "utf8": 1,
+            "format": "json",
+            "srlimit": 2
+        }
+        r = requests.get("https://ru.wikipedia.org/w/api.php", params=params, headers=headers, timeout=6)
+        if r.status_code == 200:
+            search_items = r.json().get("query", {}).get("search", [])
+            for item in search_items:
+                title = item.get("title", "")
+                snip = re.sub(r"<.*?>", "", item.get("snippet", "")).strip()
+                page_url = f"https://ru.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+                results.append(f"- Википедия ({title}): {snip} (Ссылка: {page_url})")
+    except Exception:
+        pass
+    return results
+
+def search_youtube(query, max_results=4):
+    results = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8"
+    }
+    try:
+        url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+        resp = requests.get(url, headers=headers, timeout=8)
+        if resp.status_code == 200:
+            html = resp.text
+            # Ищем каналы, если спрашивают про ютубера/стримера
+            channels = re.findall(
+                r'"channelRenderer":\{"channelId":"([^"]+)","title":\{"simpleText":"([^"]+)"\}.*?"canonicalBaseUrl":"([^"]+)"',
+                html
+            )
+            seen_urls = set()
+            for ch_id, ch_title, ch_url in channels[:2]:
+                full_ch_url = f"https://www.youtube.com{ch_url}" if ch_url.startswith("/") else f"https://www.youtube.com/channel/{ch_id}"
+                if full_ch_url not in seen_urls:
+                    seen_urls.add(full_ch_url)
+                    results.append(f"- YouTube-канал «{ch_title}»: {full_ch_url}")
+
+            # Ищем видеоролики
+            videos = re.findall(
+                r'"videoRenderer":\{"videoId":"([a-zA-Z0-9_-]{11})".*?"title":\{"runs":\[\{"text":"([^"]+)"\}\]',
+                html
+            )
+            for vid_id, vid_title in videos:
+                v_url = f"https://www.youtube.com/watch?v={vid_id}"
+                if v_url not in seen_urls:
+                    seen_urls.add(v_url)
+                    results.append(f"- Видео на YouTube «{vid_title}»: {v_url}")
+                    if len(results) >= max_results + 2:
+                        break
+    except Exception:
+        pass
+    return results
+
+def should_use_internet(text):
+    t = text.lower().strip()
+    # На простые приветствия интернет не тратим
+    short_greetings = {"привет", "ку", "здравствуй", "здравствуйте", "спасибо", "ок", "понял", "ясно", "пока"}
+    if t in short_greetings or len(t) < 4:
+        return False
+    return True
+
+def gather_web_context(user_text):
+    if not should_use_internet(user_text):
+        return ""
+
+    # Очищаем запрос от лишних слов для более точного поиска
+    clean_q = re.sub(r"^(расскажи про|кто такой|кто такая|что такое|найди|скинь|покажи)\s+", "", user_text.strip(), flags=re.IGNORECASE)
+    if not clean_q:
+        clean_q = user_text.strip()
+
+    web_res = search_duckduckgo(clean_q, max_results=5)
+    wiki_res = search_wikipedia_ru(clean_q)
+    yt_res = search_youtube(clean_q, max_results=4)
+
+    blocks = []
+    if web_res:
+        blocks.append("Результаты из интернета:\n" + "\n".join(web_res))
+    if wiki_res:
+        blocks.append("Результаты из Википедии:\n" + "\n".join(wiki_res))
+    if yt_res:
+        blocks.append("Найденные каналы и видео на YouTube:\n" + "\n".join(yt_res))
+
+    if not blocks:
+        return ""
+
+    return (
+        "\n\n[СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА И YOUTUBE ПО ЗАПРОСУ ПОЛЬЗОВАТЕЛЯ]\n"
+        + "\n\n".join(blocks)
+        + "\n[КОНЕЦ ДАННЫХ ИЗ ИНТЕРНЕТА. Используй эти реальные факты и ссылки для ответа!]"
+    )
+
+# ================= РАБОТА С ИИ И МЕДИА =================
+
+def ask_groq(user, user_text):
     uid = str(user.id)
     sys_prompt = build_system_prompt(user)
-    histories = memory_data.setdefault("histories", {})
-    if uid not in histories or not histories[uid]:
-        histories[uid] = [{"role": "system", "content": sys_prompt}]
+
+    if uid not in chat_histories or not chat_histories[uid]:
+        chat_histories[uid] = [{"role": "system", "content": sys_prompt}]
     else:
-        histories[uid][0] = {"role": "system", "content": sys_prompt}
-    return histories[uid]
+        chat_histories[uid][0] = {"role": "system", "content": sys_prompt}
+
+    web_context = gather_web_context(user_text)
+    full_user_message = user_text + web_context if web_context else user_text
+
+    # В историю сохраняем компактно, а в текущий запрос передаём все найденные данные из интернета
+    messages_for_api = list(chat_histories[uid]) + [{"role": "user", "content": full_user_message}]
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    last_error = ""
+    for model_name in MAIN_MODELS:
+        payload = {
+            "model": model_name,
+            "messages": messages_for_api,
+            "temperature": 0.5
+        }
+        try:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+            if response.status_code == 200:
+                raw_answer = response.json()["choices"][0]["message"]["content"]
+                clean_answer = clean_formatting(raw_answer)
+
+                chat_histories[uid].append({"role": "user", "content": user_text})
+                chat_histories[uid].append({"role": "assistant", "content": clean_answer})
+                if len(chat_histories[uid]) > 15:
+                    chat_histories[uid] = [chat_histories[uid][0]] + chat_histories[uid][-14:]
+
+                return clean_answer
+            else:
+                last_error = f"({response.status_code}): {response.text}"
+        except Exception as e:
+            last_error = str(e)
+
+    return f"Ошибка соединения с ИИ: {last_error}"
 
 def convert_media_to_jpeg(raw_bytes, filename="file.bin"):
-    """Превращает любое фото, WebP-стикер, видео-стикер (.webm) или GIF (.mp4) в чистый JPEG для ИИ."""
     ext = os.path.splitext(filename)[1].lower()
-
-    # 1. Пробуем открыть как изображение через Pillow (JPG, PNG, WEBP, статический GIF)
     if HAS_PIL and ext not in [".webm", ".mp4", ".tgs"]:
         try:
             img = Image.open(io.BytesIO(raw_bytes))
@@ -189,7 +348,6 @@ def convert_media_to_jpeg(raw_bytes, filename="file.bin"):
         except Exception:
             pass
 
-    # 2. Если это видео-стикер (.webm) или анимация (.mp4/.gif), вытаскиваем кадр через ffmpeg
     try:
         with tempfile.NamedTemporaryFile(suffix=ext or ".bin", delete=False) as inp:
             inp.write(raw_bytes)
@@ -211,61 +369,9 @@ def convert_media_to_jpeg(raw_bytes, filename="file.bin"):
             os.remove(inp_path)
     except Exception:
         pass
-
     return raw_bytes
 
-def ask_groq(user, user_text):
-    global CURRENT_MODEL
-    if not AVAILABLE_MODELS:
-        fetch_working_models()
-    if not AVAILABLE_MODELS:
-        return "Не удалось получить список доступных моделей от Groq."
-
-    history = get_user_history(user)
-    history.append({"role": "user", "content": user_text})
-
-    if len(history) > 17:
-        history[:] = [history[0]] + history[-16:]
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    models_to_try = [CURRENT_MODEL] + [m for m in AVAILABLE_MODELS if m != CURRENT_MODEL]
-    last_error = ""
-
-    for model_name in models_to_try:
-        if not model_name:
-            continue
-        payload = {
-            "model": model_name,
-            "messages": history,
-            "temperature": 0.7
-        }
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=60
-        )
-        if response.status_code == 200:
-            CURRENT_MODEL = model_name
-            data = response.json()
-            answer = clean_response(data["choices"][0]["message"]["content"])
-            history.append({"role": "assistant", "content": answer})
-            save_memory()
-            return answer
-        else:
-            last_error = f"({response.status_code}): {response.text}"
-
-    return f"Ошибка всех моделей: {last_error}"
-
 def ask_groq_vision(user, prompt_text, raw_bytes, file_path="image.jpg", history_note="изображение"):
-    if not VISION_MODELS:
-        fetch_working_models()
-
-    # Конвертируем любой входной файл (фото/стикер/гифку) в стандартный JPEG
     jpeg_bytes = convert_media_to_jpeg(raw_bytes, file_path)
     b64_image = base64.b64encode(jpeg_bytes).decode("utf-8")
     sys_prompt = build_system_prompt(user)
@@ -275,11 +381,7 @@ def ask_groq_vision(user, prompt_text, raw_bytes, file_path="image.jpg", history
         "Content-Type": "application/json"
     }
 
-    candidates = VISION_MODELS if VISION_MODELS else PREFERRED_VISION_MODELS
-    last_err = ""
-
-    # 1. Пробуем мультимодальные модели Groq (включая qwen/qwen3.8-27b)
-    for v_model in candidates:
+    for v_model in VISION_MODELS:
         payload = {
             "model": v_model,
             "messages": [
@@ -290,9 +392,8 @@ def ask_groq_vision(user, prompt_text, raw_bytes, file_path="image.jpg", history
                             "type": "text",
                             "text": (
                                 f"{sys_prompt}\n\n"
-                                f"ВНИМАНИЕ: Пользователь прислал тебе реальное изображение ({history_note}). "
-                                f"Ты отлично видишь эту картинку! Внимательно разгляди все детали на изображении "
-                                f"(кто или что там нарисовано, эмоции, предметы, текст) и ответь пользователю: {prompt_text}"
+                                f"Пользователь прислал {history_note}. "
+                                f"Внимательно разгляди картинку и ответь простым чистым текстом без звёздочек и решёток: {prompt_text}"
                             )
                         },
                         {
@@ -312,43 +413,17 @@ def ask_groq_vision(user, prompt_text, raw_bytes, file_path="image.jpg", history
                 timeout=60
             )
             if resp.status_code == 200:
-                answer = clean_response(resp.json()["choices"][0]["message"]["content"])
-                history = get_user_history(user)
-                history.append({"role": "user", "content": f"[Пользователь показал {history_note}: {prompt_text}]"})
-                history.append({"role": "assistant", "content": answer})
-                save_memory()
+                answer = clean_formatting(resp.json()["choices"][0]["message"]["content"])
+                uid = str(user.id)
+                if uid not in chat_histories:
+                    chat_histories[uid] = [{"role": "system", "content": sys_prompt}]
+                chat_histories[uid].append({"role": "user", "content": f"[Пользователь прислал {history_note}]"})
+                chat_histories[uid].append({"role": "assistant", "content": answer})
                 return answer
-            else:
-                last_err = f"{v_model}: {resp.status_code}"
-        except Exception as e:
-            last_err = str(e)
+        except Exception:
+            continue
 
-    # 2. Резервный зрительный канал (OpenAI-совместимый мультимодальный эндпоинт), если на Groq лимит
-    try:
-        fallback_payload = {
-            "model": "openai",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"{sys_prompt}\n\nОпиши и отреагируй на это изображение ({history_note}): {prompt_text}"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
-                    ]
-                }
-            ]
-        }
-        r2 = requests.post("https://text.pollinations.ai/openai", json=fallback_payload, timeout=45)
-        if r2.status_code == 200:
-            ans = clean_response(r2.json()["choices"][0]["message"]["content"])
-            history = get_user_history(user)
-            history.append({"role": "user", "content": f"[Пользователь показал {history_note}: {prompt_text}]"})
-            history.append({"role": "assistant", "content": ans})
-            save_memory()
-            return ans
-    except Exception:
-        pass
-
-    return f"Не удалось распознать картинку через модуль зрения ({last_err})."
+    return "Не удалось распознать картинку."
 
 def transcribe_voice(voice_bytes):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -377,32 +452,20 @@ def send_long_message(chat_id, text, reply_markup=None):
     max_length = 4000
     for i in range(0, len(text), max_length):
         chunk = text[i:i + max_length]
-        try:
-            bot.send_message(chat_id, chunk, parse_mode="Markdown", reply_markup=reply_markup)
-        except Exception:
-            bot.send_message(chat_id, chunk, reply_markup=reply_markup)
+        bot.send_message(chat_id, chunk, reply_markup=reply_markup)
 
 @bot.message_handler(commands=["start"])
 def start_cmd(message):
     user = message.from_user
     uid = str(user.id)
-    memory_data.setdefault("histories", {})[uid] = [{"role": "system", "content": build_system_prompt(user)}]
-    save_memory()
-
+    chat_histories[uid] = [{"role": "system", "content": build_system_prompt(user)}]
     name = user.first_name or "друг"
-    mode_key = memory_data.get("modes", {}).get(uid, "coder")
-    v_model = VISION_MODELS[0] if VISION_MODELS else "qwen/qwen3.8-27b"
     bot.send_message(
         message.chat.id,
-        f"Привет, {name}! 👋 Я твой ИИ-бот (версия {BOT_VERSION}).\n"
-        f"🧠 Текстовая модель: {CURRENT_MODEL}\n"
-        f"👁 Модель зрения: {v_model}\n"
-        f"🎭 Режим: {MODE_NAMES.get(mode_key)}\n\n"
-        "Что я умею:\n"
-        "• Знаю тебя по имени и помню факты о тебе\n"
-        "• Реально вижу фотографии, стикеры (даже видео-стикеры!) и гифки 👀\n"
-        "• Понимаю голосовые сообщения 🎤\n"
-        "• Запишу любой факт, если напишешь: Запомни: ...",
+        f"Привет, {name}! Я обновлён до версии {BOT_VERSION}.\n"
+        f"Время в Москве: {get_moscow_time_str()}\n\n"
+        "Пиши любой вопрос — у меня есть доступ в интернет и поиск по YouTube, "
+        "а также я понимаю фото, стикеры, гифки и голосовые сообщения.",
         reply_markup=get_keyboard()
     )
 
@@ -411,140 +474,32 @@ def start_cmd(message):
 def clear_cmd(message):
     user = message.from_user
     uid = str(user.id)
-    memory_data.setdefault("histories", {})[uid] = [{"role": "system", "content": build_system_prompt(user)}]
-    save_memory()
+    chat_histories[uid] = [{"role": "system", "content": build_system_prompt(user)}]
     bot.send_message(
         message.chat.id,
-        "🧹 История диалога очищена! (Твоё имя и факты в «👤 Обо мне» сохранены).",
+        "Память диалога очищена! О чём поговорим?",
         reply_markup=get_keyboard()
     )
 
-@bot.message_handler(commands=["remember"])
-def remember_cmd(message):
-    uid = str(message.from_user.id)
-    fact = message.text.replace("/remember", "", 1).strip()
-    if not fact:
-        bot.send_message(message.chat.id, "Напиши так: /remember Мне нравится Python и серверы в Нидерландах")
-        return
-    facts = memory_data.setdefault("facts", {}).setdefault(uid, [])
-    facts.append(fact)
-    save_memory()
-    bot.send_message(message.chat.id, f"✅ Запомнил навсегда:\n«{fact}»", reply_markup=get_keyboard())
-
-@bot.message_handler(commands=["forget_facts"])
-def forget_facts_cmd(message):
-    uid = str(message.from_user.id)
-    memory_data.setdefault("facts", {})[uid] = []
-    save_memory()
-    bot.send_message(message.chat.id, "🗑 Все сохранённые факты о тебе удалены.", reply_markup=get_keyboard())
-
-@bot.message_handler(commands=["profile"])
-@bot.message_handler(func=lambda msg: msg.text == "👤 Обо мне")
-def profile_cmd(message):
-    user = message.from_user
-    uid = str(user.id)
-    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
-    username = f"@{user.username}" if user.username else "не указан"
-    facts = memory_data.get("facts", {}).get(uid, [])
-    facts_str = "\n".join([f"• {f}" for f in facts]) if facts else "Пока пусто. Напиши «Запомни: ...», чтобы добавить факт!"
-
-    bot.send_message(
-        message.chat.id,
-        f"👤 Твой профиль в моей памяти:\n\n"
-        f"• Имя: {full_name}\n"
-        f"• Username: {username}\n"
-        f"• Telegram ID: {uid}\n\n"
-        f"📌 Что я знаю о тебе:\n{facts_str}\n\n"
-        f"Чтобы добавить факт, напиши: Запомни: твой факт\n"
-        f"Чтобы стереть факты: /forget_facts",
-        reply_markup=get_keyboard()
-    )
-
-@bot.message_handler(commands=["mode"])
-@bot.message_handler(func=lambda msg: msg.text == "🎭 Режим")
-def mode_cmd(message):
-    uid = str(message.from_user.id)
-    current_mode = memory_data.get("modes", {}).get(uid, "coder")
-    kb = types.InlineKeyboardMarkup()
-    for key, label in MODE_NAMES.items():
-        prefix = "✅ " if key == current_mode else ""
-        kb.add(types.InlineKeyboardButton(text=f"{prefix}{label}", callback_data=f"setmode|{key}"))
-    bot.send_message(message.chat.id, "🎭 Выбери характер и режим общения бота:", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("setmode|"))
-def set_mode_callback(call):
-    uid = str(call.from_user.id)
-    mode_key = call.data.split("|", 1)[1]
-    if mode_key in MODES:
-        memory_data.setdefault("modes", {})[uid] = mode_key
-        save_memory()
-        bot.answer_callback_query(call.id, f"Режим: {MODE_NAMES[mode_key]}")
-        bot.edit_message_text(
-            f"✅ Включён режим: {MODE_NAMES[mode_key]}",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id
-        )
-
-@bot.message_handler(commands=["models"])
-@bot.message_handler(func=lambda msg: msg.text == "🤖 Модели ИИ")
-def models_cmd(message):
-    fetch_working_models()
-    if not AVAILABLE_MODELS:
-        bot.send_message(message.chat.id, "Список моделей пуст или ключ недоступен.")
-        return
-
-    inline_kb = types.InlineKeyboardMarkup()
-    for m in AVAILABLE_MODELS[:10]:
-        prefix = "✅ " if m == CURRENT_MODEL else "🔹 "
-        inline_kb.add(types.InlineKeyboardButton(text=f"{prefix}{m}", callback_data=f"setmodel|{m}"))
-
-    bot.send_message(
-        message.chat.id,
-        f"Сейчас активна текстовая модель: {CURRENT_MODEL}\n"
-        f"Модель зрения (фото/стикеры/гифки): {VISION_MODELS[0] if VISION_MODELS else 'qwen/qwen3.8-27b'}\n\n"
-        "Нажми на любую модель ниже, чтобы переключиться:",
-        reply_markup=inline_kb
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("setmodel|"))
-def set_model_callback(call):
-    global CURRENT_MODEL
-    selected = call.data.split("|", 1)[1]
-    CURRENT_MODEL = selected
-    bot.answer_callback_query(call.id, f"Выбрана модель: {selected}")
-    bot.edit_message_text(
-        f"✅ Активная модель переключена на: {CURRENT_MODEL}",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id
-    )
-
-# Обработка фотографий
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     try:
         bot.send_chat_action(message.chat.id, "typing")
         file_id = message.photo[-1].file_id
         img_bytes, file_path = download_telegram_file(file_id)
-        caption = message.caption or "Опиши подробно, что ты видишь на этом фото, и ответь мне!"
+        caption = message.caption or "Опиши, что ты видишь на этом фото, и ответь мне."
         reply = ask_groq_vision(message.from_user, caption, img_bytes, file_path, "фотографию")
         send_long_message(message.chat.id, reply, reply_markup=get_keyboard())
     except Exception as e:
         bot.send_message(message.chat.id, f"Не удалось прочитать фото: {e}")
 
-# Обработка стикеров Telegram (обычных, видео и анимированных)
 @bot.message_handler(content_types=["sticker"])
 def handle_sticker(message):
     try:
         bot.send_chat_action(message.chat.id, "typing")
         st = message.sticker
         emoji = st.emoji or "🙂"
-        set_name = st.set_name or "неизвестный набор"
-        prompt = (
-            f"Пользователь прислал тебе стикер в Telegram (смайлик стикера: {emoji}, набор: {set_name}). "
-            f"НЕ выдумывай картинку по смайлику — посмотри именно на само изображение стикера, скажи кто или что на нём изображено, и прикольно отреагируй!"
-        )
-
-        # Сначала пробуем взять сам файл стикера (если это webp или видео-стикер webm), либо его превью
+        prompt = "Посмотри на изображение этого стикера, скажи кто или что на нём и отреагируй в тему диалога."
         thumb = getattr(st, "thumbnail", None) or getattr(st, "thumb", None)
         if not st.is_animated:
             raw_bytes, file_path = download_telegram_file(st.file_id)
@@ -554,37 +509,30 @@ def handle_sticker(message):
             raw_bytes, file_path = None, ""
 
         if raw_bytes:
-            reply = ask_groq_vision(message.from_user, prompt, raw_bytes, file_path, f"стикер ({emoji})")
+            reply = ask_groq_vision(message.from_user, prompt, raw_bytes, file_path, f"стикер {emoji}")
         else:
-            reply = ask_groq(message.from_user, prompt)
-
+            reply = ask_groq(message.from_user, f"Пользователь прислал стикер {emoji}")
         send_long_message(message.chat.id, reply, reply_markup=get_keyboard())
     except Exception as e:
         bot.send_message(message.chat.id, f"Не удалось разглядеть стикер: {e}")
 
-# Обработка GIF-анимаций
 @bot.message_handler(content_types=["animation"])
 def handle_animation(message):
     try:
         bot.send_chat_action(message.chat.id, "typing")
         anim = message.animation
         caption = message.caption or ""
-        prompt = (
-            f"Пользователь прислал GIF-анимацию в Telegram. {caption} "
-            "Посмотри на кадр из этой гифки, опиши кто или что на ней и прикольно отреагируй в тему!"
-        )
+        prompt = f"Посмотри на кадр из этой гифки и отреагируй в тему разговора. {caption}"
         thumb = getattr(anim, "thumbnail", None) or getattr(anim, "thumb", None)
         if thumb:
             raw_bytes, file_path = download_telegram_file(thumb.file_id)
         else:
             raw_bytes, file_path = download_telegram_file(anim.file_id)
-
-        reply = ask_groq_vision(message.from_user, prompt, raw_bytes, file_path, "GIF-анимацию")
+        reply = ask_groq_vision(message.from_user, prompt, raw_bytes, file_path, "гифку")
         send_long_message(message.chat.id, reply, reply_markup=get_keyboard())
     except Exception as e:
         bot.send_message(message.chat.id, f"Не удалось открыть гифку: {e}")
 
-# Обработка голосовых сообщений
 @bot.message_handler(content_types=["voice", "audio"])
 def handle_voice(message):
     try:
@@ -593,7 +541,7 @@ def handle_voice(message):
         voice_bytes, _ = download_telegram_file(file_id)
         text = transcribe_voice(voice_bytes)
         if not text:
-            bot.send_message(message.chat.id, "Не удалось разобрать голосовое сообщение 🎤")
+            bot.send_message(message.chat.id, "Не удалось разобрать голосовое сообщение.")
             return
         bot.send_message(message.chat.id, f"🎤 Ты сказал: «{text}»")
         bot.send_chat_action(message.chat.id, "typing")
@@ -602,33 +550,15 @@ def handle_voice(message):
     except Exception as e:
         bot.send_message(message.chat.id, f"Ошибка обработки голосового: {e}")
 
-# Обработка обычного текста
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     try:
-        text = message.text.strip()
-        uid = str(message.from_user.id)
-
-        lower = text.lower()
-        if lower.startswith("запомни:") or lower.startswith("запомни, что") or lower.startswith("запомни что"):
-            fact = re.sub(r"^запомни(:,?\s*что|\s*:)\s*", "", text, flags=re.IGNORECASE).strip()
-            if fact:
-                facts = memory_data.setdefault("facts", {}).setdefault(uid, [])
-                facts.append(fact)
-                save_memory()
-                bot.send_message(
-                    message.chat.id,
-                    f"🧠 Записал в долгую память:\n«{fact}»",
-                    reply_markup=get_keyboard()
-                )
-                return
-
         bot.send_chat_action(message.chat.id, "typing")
-        reply = ask_groq(message.from_user, text)
+        reply = ask_groq(message.from_user, message.text.strip())
         send_long_message(message.chat.id, reply, reply_markup=get_keyboard())
     except Exception as e:
         bot.send_message(message.chat.id, f"Произошла ошибка: {e}")
 
 if __name__ == "__main__":
-    print(f"ИИ-бот запущен! Версия: {BOT_VERSION}, Модель: {CURRENT_MODEL}")
+    print(f"ИИ-бот запущен! Версия: {BOT_VERSION}")
     bot.infinity_polling(timeout=20, long_polling_timeout=10)
