@@ -1,16 +1,25 @@
 import os
+import io
 import re
 import json
 import base64
+import tempfile
+import subprocess
 import telebot
 from telebot import types
 import requests
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 # Твои токены (разделены плюсом, чтобы защита GitHub не блокировала ключ)
 TELEGRAM_TOKEN = "8967141379:" + "AAFIy52g-Rz0ff73dFQaTn1t7PZ0xlU7Qjs"
 GROQ_API_KEY = "gsk_" + "7ZZ7rgRfeBzOIEnchdcyWGdyb3FYPeTrVNq4oew7RXzxiVfAmn20"
 
-BOT_VERSION = "3.0"
+BOT_VERSION = "3.1"
 MEMORY_FILE = "/root/ai-bot/memory.json"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -21,39 +30,35 @@ CURRENT_MODEL = None
 
 PREFERRED_MODELS = [
     "openai/gpt-oss-120b",
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "qwen/qwen3-32b",
-    "deepseek-r1-distill-llama-70b",
+    "qwen/qwen3.8-27b",
     "llama-3.3-70b-versatile",
     "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
-    "gemma2-9b-it"
+    "llama-3.1-8b-instant"
 ]
 
+# Актуальные модели со зрением на Groq (Qwen 3.8 27B — главная мультимодальная модель)
 PREFERRED_VISION_MODELS = [
+    "qwen/qwen3.8-27b",
     "meta-llama/llama-4-scout-17b-16e-instruct",
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
-    "llama-3.2-90b-vision-preview",
-    "llama-3.2-11b-vision-preview"
+    "meta-llama/llama-4-maverick-17b-128e-instruct"
 ]
 
 SKIP_KEYWORDS = ["whisper", "tts", "guard", "playai", "orpheus", "embed", "allam"]
 
 MODES = {
     "coder": (
-        "Ты личный ИИ-ассистент и опытный программист в Telegram (версия 3.0). "
+        "Ты личный ИИ-ассистент и опытный программист в Telegram (версия 3.1). "
         "Ты работаешь на сервере своего создателя в Нидерландах и обновляешься напрямую с его GitHub. "
         "Отвечай четко, подробно и по делу на русском языке. "
         "Когда просят написать код — пиши полный, рабочий и чистый код без сокращений."
     ),
     "bro": (
-        "Ты лучший друг и ИИ-бро в Telegram (версия 3.0), живущий на сервере в Нидерландах. "
+        "Ты лучший друг и ИИ-бро в Telegram (версия 3.1), живущий на сервере в Нидерландах. "
         "Общайся живо, по-дружески, с хорошим юмором и приколами, поддерживай разговор, "
         "эмоционально реагируй на стикеры, гифки и фото, но когда просят помочь с делом или кодом — помогай на высшем уровне."
     ),
     "expert": (
-        "Ты аналитический ИИ-эксперт и системный архитектор в Telegram (версия 3.0). "
+        "Ты аналитический ИИ-эксперт и системный архитектор в Telegram (версия 3.1). "
         "Давай максимально глубокие, точные и структурированные ответы, разбирай задачи по шагам."
     )
 }
@@ -64,7 +69,6 @@ MODE_NAMES = {
     "expert": "🧠 Ультра-эксперт"
 }
 
-# Загрузка и сохранение постоянной памяти на диске
 def load_memory():
     if os.path.exists(MEMORY_FILE):
         try:
@@ -103,10 +107,13 @@ def fetch_working_models():
                     sorted_models.append(m)
 
             AVAILABLE_MODELS = sorted_models
-            VISION_MODELS = [m for m in PREFERRED_VISION_MODELS if m in models]
+
+            # Собираем доступные модели со зрением
+            v_list = [m for m in PREFERRED_VISION_MODELS if m in models]
             for m in models:
-                if ("vision" in m.lower() or "llama-4" in m.lower()) and m not in VISION_MODELS:
-                    VISION_MODELS.append(m)
+                if any(k in m.lower() for k in ["qwen3.8", "vision", "llama-4"]) and m not in v_list:
+                    v_list.append(m)
+            VISION_MODELS = v_list if v_list else PREFERRED_VISION_MODELS
 
             if AVAILABLE_MODELS and (CURRENT_MODEL not in AVAILABLE_MODELS):
                 CURRENT_MODEL = AVAILABLE_MODELS[0]
@@ -140,7 +147,7 @@ def build_system_prompt(user):
         f"- Username: {username}\n"
         f"- Telegram ID: {uid}\n"
         f"- Сохранённые факты о пользователе:\n{facts_text}\n"
-        f"Всегда обращайся к пользователю по имени ({first_name or full_name}), если это уместно, и помни эти факты!"
+        f"Обращайся к пользователю по имени ({first_name or full_name}), когда уместно, и помни эти факты!"
     )
     return base_prompt + profile_block
 
@@ -157,6 +164,55 @@ def get_user_history(user):
     else:
         histories[uid][0] = {"role": "system", "content": sys_prompt}
     return histories[uid]
+
+def convert_media_to_jpeg(raw_bytes, filename="file.bin"):
+    """Превращает любое фото, WebP-стикер, видео-стикер (.webm) или GIF (.mp4) в чистый JPEG для ИИ."""
+    ext = os.path.splitext(filename)[1].lower()
+
+    # 1. Пробуем открыть как изображение через Pillow (JPG, PNG, WEBP, статический GIF)
+    if HAS_PIL and ext not in [".webm", ".mp4", ".tgs"]:
+        try:
+            img = Image.open(io.BytesIO(raw_bytes))
+            if getattr(img, "is_animated", False):
+                img.seek(0)
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                rgba = img.convert("RGBA")
+                bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.split()[3])
+                img = bg
+            else:
+                img = img.convert("RGB")
+            img.thumbnail((1024, 1024))
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=88)
+            return out.getvalue()
+        except Exception:
+            pass
+
+    # 2. Если это видео-стикер (.webm) или анимация (.mp4/.gif), вытаскиваем кадр через ffmpeg
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext or ".bin", delete=False) as inp:
+            inp.write(raw_bytes)
+            inp_path = inp.name
+        out_path = inp_path + ".jpg"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", inp_path, "-vframes", "1", "-q:v", "2", out_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10
+        )
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            with open(out_path, "rb") as f:
+                jpg_data = f.read()
+            os.remove(inp_path)
+            os.remove(out_path)
+            return jpg_data
+        if os.path.exists(inp_path):
+            os.remove(inp_path)
+    except Exception:
+        pass
+
+    return raw_bytes
 
 def ask_groq(user, user_text):
     global CURRENT_MODEL
@@ -205,19 +261,24 @@ def ask_groq(user, user_text):
 
     return f"Ошибка всех моделей: {last_error}"
 
-def ask_groq_vision(user, prompt_text, image_bytes, mime_type="image/jpeg", history_note="фото"):
+def ask_groq_vision(user, prompt_text, raw_bytes, file_path="image.jpg", history_note="изображение"):
     if not VISION_MODELS:
         fetch_working_models()
 
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+    # Конвертируем любой входной файл (фото/стикер/гифку) в стандартный JPEG
+    jpeg_bytes = convert_media_to_jpeg(raw_bytes, file_path)
+    b64_image = base64.b64encode(jpeg_bytes).decode("utf-8")
     sys_prompt = build_system_prompt(user)
+
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
 
     candidates = VISION_MODELS if VISION_MODELS else PREFERRED_VISION_MODELS
+    last_err = ""
 
+    # 1. Пробуем мультимодальные модели Groq (включая qwen/qwen3.8-27b)
     for v_model in candidates:
         payload = {
             "model": v_model,
@@ -225,15 +286,23 @@ def ask_groq_vision(user, prompt_text, image_bytes, mime_type="image/jpeg", hist
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": f"{sys_prompt}\n\nЗапрос пользователя: {prompt_text}"},
+                        {
+                            "type": "text",
+                            "text": (
+                                f"{sys_prompt}\n\n"
+                                f"ВНИМАНИЕ: Пользователь прислал тебе реальное изображение ({history_note}). "
+                                f"Ты отлично видишь эту картинку! Внимательно разгляди все детали на изображении "
+                                f"(кто или что там нарисовано, эмоции, предметы, текст) и ответь пользователю: {prompt_text}"
+                            )
+                        },
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}
                         }
                     ]
                 }
             ],
-            "temperature": 0.7
+            "temperature": 0.6
         }
         try:
             resp = requests.post(
@@ -245,16 +314,41 @@ def ask_groq_vision(user, prompt_text, image_bytes, mime_type="image/jpeg", hist
             if resp.status_code == 200:
                 answer = clean_response(resp.json()["choices"][0]["message"]["content"])
                 history = get_user_history(user)
-                history.append({"role": "user", "content": f"[Пользователь отправил {history_note}: {prompt_text}]"})
+                history.append({"role": "user", "content": f"[Пользователь показал {history_note}: {prompt_text}]"})
                 history.append({"role": "assistant", "content": answer})
                 save_memory()
                 return answer
-        except Exception:
-            continue
+            else:
+                last_err = f"{v_model}: {resp.status_code}"
+        except Exception as e:
+            last_err = str(e)
 
-    # Если ни одна зрительная модель не смогла обработать формат (например, сложный анимированный стикер),
-    # отвечаем через основную текстовую модель по описанию
-    return ask_groq(user, f"[Пользователь прислал {history_note}]. {prompt_text}")
+    # 2. Резервный зрительный канал (OpenAI-совместимый мультимодальный эндпоинт), если на Groq лимит
+    try:
+        fallback_payload = {
+            "model": "openai",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"{sys_prompt}\n\nОпиши и отреагируй на это изображение ({history_note}): {prompt_text}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+                    ]
+                }
+            ]
+        }
+        r2 = requests.post("https://text.pollinations.ai/openai", json=fallback_payload, timeout=45)
+        if r2.status_code == 200:
+            ans = clean_response(r2.json()["choices"][0]["message"]["content"])
+            history = get_user_history(user)
+            history.append({"role": "user", "content": f"[Пользователь показал {history_note}: {prompt_text}]"})
+            history.append({"role": "assistant", "content": ans})
+            save_memory()
+            return ans
+    except Exception:
+        pass
+
+    return f"Не удалось распознать картинку через модуль зрения ({last_err})."
 
 def transcribe_voice(voice_bytes):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -297,17 +391,18 @@ def start_cmd(message):
 
     name = user.first_name or "друг"
     mode_key = memory_data.get("modes", {}).get(uid, "coder")
+    v_model = VISION_MODELS[0] if VISION_MODELS else "qwen/qwen3.8-27b"
     bot.send_message(
         message.chat.id,
         f"Привет, {name}! 👋 Я твой ИИ-бот (версия {BOT_VERSION}).\n"
-        f"🧠 Активная модель: {CURRENT_MODEL}\n"
+        f"🧠 Текстовая модель: {CURRENT_MODEL}\n"
+        f"👁 Модель зрения: {v_model}\n"
         f"🎭 Режим: {MODE_NAMES.get(mode_key)}\n\n"
-        "Что я теперь умею:\n"
-        "• Знаю, как тебя зовут, и помню факты о тебе\n"
-        "• Вижу фотографии, скриншоты, стикеры и гифки 👀\n"
+        "Что я умею:\n"
+        "• Знаю тебя по имени и помню факты о тебе\n"
+        "• Реально вижу фотографии, стикеры (даже видео-стикеры!) и гифки 👀\n"
         "• Понимаю голосовые сообщения 🎤\n"
-        "• Чтобы я запомнил важный факт навсегда, напиши:\n"
-        "Запомни: <любой факт о тебе>",
+        "• Запишу любой факт, если напишешь: Запомни: ...",
         reply_markup=get_keyboard()
     )
 
@@ -320,7 +415,7 @@ def clear_cmd(message):
     save_memory()
     bot.send_message(
         message.chat.id,
-        "🧹 История текущего диалога очищена! (Но твоё имя и факты в «👤 Обо мне» я всё равно помню).",
+        "🧹 История диалога очищена! (Твоё имя и факты в «👤 Обо мне» сохранены).",
         reply_markup=get_keyboard()
     )
 
@@ -406,7 +501,7 @@ def models_cmd(message):
     bot.send_message(
         message.chat.id,
         f"Сейчас активна текстовая модель: {CURRENT_MODEL}\n"
-        f"Модель зрения (для фото/стикеров/гифок): {VISION_MODELS[0] if VISION_MODELS else 'Авто'}\n\n"
+        f"Модель зрения (фото/стикеры/гифки): {VISION_MODELS[0] if VISION_MODELS else 'qwen/qwen3.8-27b'}\n\n"
         "Нажми на любую модель ниже, чтобы переключиться:",
         reply_markup=inline_kb
     )
@@ -429,47 +524,43 @@ def handle_photo(message):
     try:
         bot.send_chat_action(message.chat.id, "typing")
         file_id = message.photo[-1].file_id
-        img_bytes, _ = download_telegram_file(file_id)
-        caption = message.caption or "Посмотри на это фото, опиши что на нём или ответь по сути изображения."
-        reply = ask_groq_vision(message.from_user, caption, img_bytes, "image/jpeg", "фотографию")
+        img_bytes, file_path = download_telegram_file(file_id)
+        caption = message.caption or "Опиши подробно, что ты видишь на этом фото, и ответь мне!"
+        reply = ask_groq_vision(message.from_user, caption, img_bytes, file_path, "фотографию")
         send_long_message(message.chat.id, reply, reply_markup=get_keyboard())
     except Exception as e:
         bot.send_message(message.chat.id, f"Не удалось прочитать фото: {e}")
 
-# Обработка стикеров Telegram
+# Обработка стикеров Telegram (обычных, видео и анимированных)
 @bot.message_handler(content_types=["sticker"])
 def handle_sticker(message):
     try:
         bot.send_chat_action(message.chat.id, "typing")
         st = message.sticker
         emoji = st.emoji or "🙂"
-        set_name = st.set_name or "неизвестный стикерпак"
+        set_name = st.set_name or "неизвестный набор"
         prompt = (
-            f"Пользователь прислал тебе стикер в Telegram (связанный смайлик: {emoji}, "
-            f"название набора: {set_name}). Посмотри на изображение стикера и живо, с юмором или в тему диалога отреагируй на него!"
+            f"Пользователь прислал тебе стикер в Telegram (смайлик стикера: {emoji}, набор: {set_name}). "
+            f"НЕ выдумывай картинку по смайлику — посмотри именно на само изображение стикера, скажи кто или что на нём изображено, и прикольно отреагируй!"
         )
 
-        target_file_id = None
-        mime_type = "image/webp"
-        if not st.is_animated and not st.is_video:
-            target_file_id = st.file_id
+        # Сначала пробуем взять сам файл стикера (если это webp или видео-стикер webm), либо его превью
+        thumb = getattr(st, "thumbnail", None) or getattr(st, "thumb", None)
+        if not st.is_animated:
+            raw_bytes, file_path = download_telegram_file(st.file_id)
+        elif thumb:
+            raw_bytes, file_path = download_telegram_file(thumb.file_id)
         else:
-            thumb = getattr(st, "thumbnail", None) or getattr(st, "thumb", None)
-            if thumb:
-                target_file_id = thumb.file_id
-                mime_type = "image/jpeg"
+            raw_bytes, file_path = None, ""
 
-        if target_file_id:
-            img_bytes, path = download_telegram_file(target_file_id)
-            if path.endswith(".jpg") or path.endswith(".jpeg"):
-                mime_type = "image/jpeg"
-            reply = ask_groq_vision(message.from_user, prompt, img_bytes, mime_type, f"стикер {emoji} из набора {set_name}")
+        if raw_bytes:
+            reply = ask_groq_vision(message.from_user, prompt, raw_bytes, file_path, f"стикер ({emoji})")
         else:
             reply = ask_groq(message.from_user, prompt)
 
         send_long_message(message.chat.id, reply, reply_markup=get_keyboard())
     except Exception as e:
-        bot.send_message(message.chat.id, f"Классный стикер! ({e})")
+        bot.send_message(message.chat.id, f"Не удалось разглядеть стикер: {e}")
 
 # Обработка GIF-анимаций
 @bot.message_handler(content_types=["animation"])
@@ -480,15 +571,15 @@ def handle_animation(message):
         caption = message.caption or ""
         prompt = (
             f"Пользователь прислал GIF-анимацию в Telegram. {caption} "
-            "Перед тобой кадр из этой гифки — посмотри, что на ней происходит, и прикольно отреагируй в тему разговора!"
+            "Посмотри на кадр из этой гифки, опиши кто или что на ней и прикольно отреагируй в тему!"
         )
         thumb = getattr(anim, "thumbnail", None) or getattr(anim, "thumb", None)
         if thumb:
-            img_bytes, _ = download_telegram_file(thumb.file_id)
-            reply = ask_groq_vision(message.from_user, prompt, img_bytes, "image/jpeg", "GIF-анимацию")
+            raw_bytes, file_path = download_telegram_file(thumb.file_id)
         else:
-            reply = ask_groq(message.from_user, prompt)
+            raw_bytes, file_path = download_telegram_file(anim.file_id)
 
+        reply = ask_groq_vision(message.from_user, prompt, raw_bytes, file_path, "GIF-анимацию")
         send_long_message(message.chat.id, reply, reply_markup=get_keyboard())
     except Exception as e:
         bot.send_message(message.chat.id, f"Не удалось открыть гифку: {e}")
@@ -518,7 +609,6 @@ def handle_text(message):
         text = message.text.strip()
         uid = str(message.from_user.id)
 
-        # Быстрое сохранение факта фразой "Запомни: ..." или "Запомни что ..."
         lower = text.lower()
         if lower.startswith("запомни:") or lower.startswith("запомни, что") or lower.startswith("запомни что"):
             fact = re.sub(r"^запомни(:,?\s*что|\s*:)\s*", "", text, flags=re.IGNORECASE).strip()
