@@ -7,18 +7,14 @@ import re
 TELEGRAM_TOKEN = "8967141379:" + "AAFIy52g-Rz0ff73dFQaTn1t7PZ0xlU7Qjs"
 GROQ_API_KEY = "gsk_" + "7ZZ7rgRfeBzOIEnchdcyWGdyb3FYPeTrVNq4oew7RXzxiVfAmn20"
 
-BOT_VERSION = "2.0"
+BOT_VERSION = "2.1"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# Память диалогов пользователей
 chat_histories = {}
-
-# Список доступных моделей и текущая выбранная модель
- AVAILABLE_MODELS = []
+AVAILABLE_MODELS = []
 CURRENT_MODEL = None
 
-# Приоритет моделей (от самых мощных к базовым)
 PREFERRED_MODELS = [
     "openai/gpt-oss-120b",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
@@ -31,7 +27,6 @@ PREFERRED_MODELS = [
     "gemma2-9b-it"
 ]
 
-# Ключевые слова не-текстовых моделей (озвучка, проверка безопасности и т.д.), которые нужно пропускать
 SKIP_KEYWORDS = ["whisper", "tts", "guard", "playai", "orpheus", "embed", "allam"]
 
 SYSTEM_PROMPT = (
@@ -41,7 +36,6 @@ SYSTEM_PROMPT = (
 )
 
 def fetch_working_models():
-    """Запрашивает у Groq реальный список моделей, доступных на этом API-ключе."""
     global AVAILABLE_MODELS, CURRENT_MODEL
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     try:
@@ -53,20 +47,18 @@ def fetch_working_models():
                 m_id = m.get("id", "")
                 if not any(skip in m_id.lower() for skip in SKIP_KEYWORDS):
                     models.append(m_id)
-            
-            # Сортируем: сначала модели из нашего списка приоритетов, затем остальные
+
             sorted_models = [m for m in PREFERRED_MODELS if m in models]
             for m in models:
                 if m not in sorted_models:
                     sorted_models.append(m)
-            
+
             AVAILABLE_MODELS = sorted_models
             if AVAILABLE_MODELS and (CURRENT_MODEL not in AVAILABLE_MODELS):
                 CURRENT_MODEL = AVAILABLE_MODELS[0]
     except Exception as e:
         print(f"Ошибка получения списка моделей: {e}")
 
-# Загружаем доступные модели при старте бота
 fetch_working_models()
 
 def get_keyboard():
@@ -75,7 +67,6 @@ def get_keyboard():
     return markup
 
 def clean_response(text):
-    """Убирает скрытые теги размышлений <think>...</think>, если они есть у модели."""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     return cleaned if cleaned else text
 
@@ -88,9 +79,9 @@ def ask_groq(user_id, user_text):
 
     if user_id not in chat_histories:
         chat_histories[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    
+
     chat_histories[user_id].append({"role": "user", "content": user_text})
-    
+
     if len(chat_histories[user_id]) > 15:
         chat_histories[user_id] = [chat_histories[user_id][0]] + chat_histories[user_id][-14:]
 
@@ -99,7 +90,6 @@ def ask_groq(user_id, user_text):
         "Content-Type": "application/json"
     }
 
-    # Сначала пробуем текущую модель, а если она недоступна — перебираем остальные автоматически
     models_to_try = [CURRENT_MODEL] + [m for m in AVAILABLE_MODELS if m != CURRENT_MODEL]
     last_error = ""
 
@@ -168,7 +158,7 @@ def models_cmd(message):
         bot.send_message(message.chat.id, "Список моделей пуст или ключ недоступен.")
         return
 
-     inline_kb = types.InlineKeyboardMarkup()
+    inline_kb = types.InlineKeyboardMarkup()
     for m in AVAILABLE_MODELS[:10]:
         prefix = "✅ " if m == CURRENT_MODEL else "🔹 "
         inline_kb.add(types.InlineKeyboardButton(text=f"{prefix}{m}", callback_data=f"setmodel|{m}"))
@@ -180,28 +170,4 @@ def models_cmd(message):
         reply_markup=inline_kb
     )
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("setmodel|"))
-def set_model_callback(call):
-    global CURRENT_MODEL
-    selected = call.data.split("|", 1)[1]
-    CURRENT_MODEL = selected
-    bot.answer_callback_query(call.id, f"Выбрана модель: {selected}")
-    bot.edit_message_text(
-        f"✅ Активная модель переключена на:\n`{CURRENT_MODEL}`",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        parse_mode="Markdown"
-    )
-
-@bot.message_handler(content_types=["text"])
-def handle_text(message):
-    try:
-        bot.send_chat_action(message.chat.id, "typing")
-        reply = ask_groq(message.from_user.id, message.text)
-        send_long_message(message.chat.id, reply, reply_markup=get_keyboard())
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Произошла ошибка: {e}")
-
-if __name__ == "__main__":
-    print(f"ИИ-бот запущен! Версия: {BOT_VERSION}, Модель: {CURRENT_MODEL}")
-    bot.infinity_polling(timeout=20, long_polling_timeout=10)
+@bot
