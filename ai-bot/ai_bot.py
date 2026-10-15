@@ -6,7 +6,6 @@ import base64
 import urllib.parse
 import tempfile
 import subprocess
-from datetime import datetime, timezone, timedelta
 import telebot
 from telebot import types
 import requests
@@ -21,10 +20,9 @@ except ImportError:
 TELEGRAM_TOKEN = "8967141379:" + "AAFIy52g-Rz0ff73dFQaTn1t7PZ0xlU7Qjs"
 GROQ_API_KEY = "gsk_" + "7ZZ7rgRfeBzOIEnchdcyWGdyb3FYPeTrVNq4oew7RXzxiVfAmn20"
 
-BOT_VERSION = "4.0"
+BOT_VERSION = "4.1"
 OLD_MEMORY_FILE = "/root/ai-bot/memory.json"
 
-# Удаляем старую память с упоминаниями сервера и режимов, чтобы бот больше не тупил
 if os.path.exists(OLD_MEMORY_FILE):
     try:
         os.remove(OLD_MEMORY_FILE)
@@ -33,15 +31,19 @@ if os.path.exists(OLD_MEMORY_FILE):
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# Храним только короткую историю текущего диалога в оперативной памяти
 chat_histories = {}
 
-# Одна лучшая основная модель + авторезерв на случай перегрузки
 MAIN_MODELS = [
     "openai/gpt-oss-120b",
     "llama-3.3-70b-versatile",
     "qwen/qwen3.8-27b",
     "openai/gpt-oss-20b"
+]
+
+ROUTER_MODELS = [
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile"
 ]
 
 VISION_MODELS = [
@@ -50,17 +52,6 @@ VISION_MODELS = [
     "meta-llama/llama-4-maverick-17b-128e-instruct"
 ]
 
-DAYS_RU = [
-    "понедельник", "вторник", "среда", "четверг",
-    "пятница", "суббота", "воскресенье"
-]
-
-def get_moscow_time_str():
-    msk_tz = timezone(timedelta(hours=3))
-    now = datetime.now(msk_tz)
-    day_name = DAYS_RU[now.weekday()]
-    return now.strftime(f"%d.%m.%Y ({day_name}), %H:%M:%S по московскому времени (МСК)")
-
 def get_keyboard():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(types.KeyboardButton("🗑 Очистить память"))
@@ -68,52 +59,46 @@ def get_keyboard():
 
 def build_system_prompt(user):
     name = (user.first_name or "друг").strip()
-    msk_time = get_moscow_time_str()
     return (
         f"Ты умный, современный ИИ-помощник в Telegram.\n"
-        f"Сейчас разговариваешь с пользователем по имени: {name}.\n"
-        f"Текущее время и дата в Москве: {msk_time}.\n\n"
+        f"Сейчас разговариваешь с пользователем по имени: {name}.\n\n"
         f"СТРОГИЕ ПРАВИЛА:\n"
         f"1. НИКОГДА не пиши про серверы, Нидерланды, хостинг или GitHub.\n"
         f"2. НИКОГДА не используй в тексте символы разметки: НЕ пиши решётки (#, ##, ###), "
         f"НЕ пиши звёздочки (*, **), НЕ рисуй таблицы из вертикальных палок и тире (|---|---|), "
         f"НЕ ставь знаки цитат (>) в начале строки. Пиши только чистым, красивым обычным текстом с абзацами. "
         f"Для списков используй обычное тире (-) или цифры (1., 2.).\n"
-        f"3. Если в запросе переданы РЕЗУЛЬТАТЫ ПОИСКА ИЗ ИНТЕРНЕТА И YOUTUBE — опирайся строго на них, "
-        f"не выдумывай факты от себя и обязательно давай прямые ссылки (https://...), если они есть в результатах поиска.\n"
-        f"4. Если пользователь просит написать программный код — пиши полный, чистый рабочий код."
+        f"3. НЕ присылай ссылки на сайты или YouTube, если пользователь сам не просил ссылку, видео или информацию про конкретный канал. "
+        f"На обычное общение, благодарность или похвалу отвечай просто и по-человечески.\n"
+        f"4. Если в запросе переданы ДАННЫЕ ИЗ ИНТЕРНЕТА — используй их для точного ответа, но бери оттуда только то, что реально относится к вопросу пользователя.\n"
+        f"5. Если пользователь просит написать программный код — пиши полный, чистый рабочий код."
     )
 
 def clean_formatting(text):
-    """Удаляет уродливые таблицы |---|, решётки ### и звёздочки **, сохраняя блоки кода."""
+    """Удаляет таблицы |---|, решётки ### и звёздочки **, сохраняя блоки кода."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-    # Разделяем текст на обычный текст и блоки кода ```...```, чтобы не испортить код
     parts = re.split(r"(```[\s\S]*?```)", text)
     cleaned_parts = []
 
     for part in parts:
         if part.startswith("```") and part.endswith("```"):
-            # Убираем только тройные кавычки, оставляя сам код чистым
             code_lines = part.strip("`").splitlines()
             if code_lines and re.match(r"^[a-zA-Z0-9_+-]+$", code_lines[0].strip()):
                 code_lines = code_lines[1:]
             cleaned_parts.append("\n".join(code_lines))
             continue
 
-        # Превращаем ссылки вида [Текст](https://...) в Текст: https://...
         part = re.sub(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)", r"\1 (\2)", part)
 
         lines = part.splitlines()
         new_lines = []
         for line in lines:
-            # Удаляем строки-разделители таблиц вида |---|---| и горизонтальные линии ---
             if re.match(r"^\s*\|[\s\-:|]+\|\s*$", line):
                 continue
             if re.match(r"^\s*[\-*_]{3,}\s*$", line):
                 continue
 
-            # Если это строка таблицы | Ячейка 1 | Ячейка 2 | — превращаем в обычную строку
             if line.strip().startswith("|") and line.strip().endswith("|"):
                 cells = [c.strip() for c in line.strip().strip("|").split("|") if c.strip()]
                 if cells:
@@ -121,16 +106,10 @@ def clean_formatting(text):
                 else:
                     continue
 
-            # Убираем решётки заголовков (## Заголовок) и цитаты (>)
             line = re.sub(r"^\s*#{1,6}\s*", "", line)
             line = re.sub(r"^\s*>\s*", "", line)
-
-            # Заменяем маркеры списка "* Пункт" на "• Пункт"
             line = re.sub(r"^\s*\*\s+", "• ", line)
-
-            # Убираем все звёздочки жирного/курсивного текста (** и *)
-            line = line.replace("**", "").replace("*", "")
-            line = line.replace("__", "")
+            line = line.replace("**", "").replace("*", "").replace("__", "")
 
             new_lines.append(line)
 
@@ -140,7 +119,55 @@ def clean_formatting(text):
 
     return "\n".join(cleaned_parts).strip()
 
-# ================= ПОИСК В ИНТЕРНЕТЕ И YOUTUBE =================
+# ================= УМНЫЙ ПОИСК В ИНТЕРНЕТЕ И YOUTUBE =================
+
+def decide_search_need(user_text):
+    """Определяет через быструю модель, нужен ли вообще поиск в интернете или на YouTube для этого сообщения."""
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    router_prompt = (
+        "Определи, требует ли сообщение пользователя поиска информации в интернете или поиска видео на YouTube.\n"
+        "Правила:\n"
+        "- Если это обычное общение, приветствие, благодарность, похвала (например: 'спасибо большое ты умничка', 'красава', 'привет как дела'), "
+        "просьба написать код, решить задачу или перевести текст -> web: false, youtube: false.\n"
+        "- Если пользователь спрашивает про конкретного человека, блогера, стримера (например Т2х2), игру, компанию, новости, погоду, текущее время, курс или факт -> web: true.\n"
+        "- Если пользователь явно просит скинуть видео, ссылку на ролик/канал или спрашивает про ютубера/YouTube-канал -> youtube: true.\n"
+        "Ответь СТРОГО в формате JSON без лишнего текста:\n"
+        '{"web": false, "youtube": false, "query": "точный поисковый запрос"}'
+    )
+
+    for r_model in ROUTER_MODELS:
+        payload = {
+            "model": r_model,
+            "messages": [
+                {"role": "system", "content": router_prompt},
+                {"role": "user", "content": user_text}
+            ],
+            "temperature": 0.0
+        }
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=10
+            )
+            if resp.status_code == 200:
+                content = resp.json()["choices"][0]["message"]["content"]
+                m = re.search(r"\{.*?\}", content, flags=re.DOTALL)
+                if m:
+                    data = json.loads(m.group(0))
+                    return (
+                        bool(data.get("web", False)),
+                        bool(data.get("youtube", False)),
+                        str(data.get("query", "")).strip() or user_text
+                    )
+        except Exception:
+            continue
+
+    return False, False, user_text
 
 def search_duckduckgo(query, max_results=5):
     results = []
@@ -175,7 +202,7 @@ def search_duckduckgo(query, max_results=5):
 
 def search_wikipedia_ru(query):
     results = []
-    headers = {"User-Agent": "TelegramAIBot/4.0"}
+    headers = {"User-Agent": "TelegramAIBot/4.1"}
     try:
         params = {
             "action": "query",
@@ -197,7 +224,7 @@ def search_wikipedia_ru(query):
         pass
     return results
 
-def search_youtube(query, max_results=4):
+def search_youtube(query, max_results=3):
     results = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -208,7 +235,6 @@ def search_youtube(query, max_results=4):
         resp = requests.get(url, headers=headers, timeout=8)
         if resp.status_code == 200:
             html = resp.text
-            # Ищем каналы, если спрашивают про ютубера/стримера
             channels = re.findall(
                 r'"channelRenderer":\{"channelId":"([^"]+)","title":\{"simpleText":"([^"]+)"\}.*?"canonicalBaseUrl":"([^"]+)"',
                 html
@@ -220,7 +246,6 @@ def search_youtube(query, max_results=4):
                     seen_urls.add(full_ch_url)
                     results.append(f"- YouTube-канал «{ch_title}»: {full_ch_url}")
 
-            # Ищем видеоролики
             videos = re.findall(
                 r'"videoRenderer":\{"videoId":"([a-zA-Z0-9_-]{11})".*?"title":\{"runs":\[\{"text":"([^"]+)"\}\]',
                 html
@@ -230,48 +255,38 @@ def search_youtube(query, max_results=4):
                 if v_url not in seen_urls:
                     seen_urls.add(v_url)
                     results.append(f"- Видео на YouTube «{vid_title}»: {v_url}")
-                    if len(results) >= max_results + 2:
+                    if len(results) >= max_results + 1:
                         break
     except Exception:
         pass
     return results
 
-def should_use_internet(text):
-    t = text.lower().strip()
-    # На простые приветствия интернет не тратим
-    short_greetings = {"привет", "ку", "здравствуй", "здравствуйте", "спасибо", "ок", "понял", "ясно", "пока"}
-    if t in short_greetings or len(t) < 4:
-        return False
-    return True
-
 def gather_web_context(user_text):
-    if not should_use_internet(user_text):
+    need_web, need_yt, search_query = decide_search_need(user_text)
+    if not need_web and not need_yt:
         return ""
 
-    # Очищаем запрос от лишних слов для более точного поиска
-    clean_q = re.sub(r"^(расскажи про|кто такой|кто такая|что такое|найди|скинь|покажи)\s+", "", user_text.strip(), flags=re.IGNORECASE)
-    if not clean_q:
-        clean_q = user_text.strip()
-
-    web_res = search_duckduckgo(clean_q, max_results=5)
-    wiki_res = search_wikipedia_ru(clean_q)
-    yt_res = search_youtube(clean_q, max_results=4)
-
     blocks = []
-    if web_res:
-        blocks.append("Результаты из интернета:\n" + "\n".join(web_res))
-    if wiki_res:
-        blocks.append("Результаты из Википедии:\n" + "\n".join(wiki_res))
-    if yt_res:
-        blocks.append("Найденные каналы и видео на YouTube:\n" + "\n".join(yt_res))
+    if need_web:
+        web_res = search_duckduckgo(search_query, max_results=5)
+        wiki_res = search_wikipedia_ru(search_query)
+        if web_res:
+            blocks.append("Результаты из интернета:\n" + "\n".join(web_res))
+        if wiki_res:
+            blocks.append("Результаты из Википедии:\n" + "\n".join(wiki_res))
+
+    if need_yt:
+        yt_res = search_youtube(search_query, max_results=3)
+        if yt_res:
+            blocks.append("Найденные каналы и видео на YouTube:\n" + "\n".join(yt_res))
 
     if not blocks:
         return ""
 
     return (
-        "\n\n[СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА И YOUTUBE ПО ЗАПРОСУ ПОЛЬЗОВАТЕЛЯ]\n"
+        "\n\n[СПРАВОЧНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА ПО ВОПРОСУ ПОЛЬЗОВАТЕЛЯ]\n"
         + "\n\n".join(blocks)
-        + "\n[КОНЕЦ ДАННЫХ ИЗ ИНТЕРНЕТА. Используй эти реальные факты и ссылки для ответа!]"
+        + "\n[КОНЕЦ СПРАВОЧНЫХ ДАННЫХ. Ответь на вопрос пользователя. Ссылки давай ТОЛЬКО если пользователь сам их попросил или спрашивал про канал/видео!]"
     )
 
 # ================= РАБОТА С ИИ И МЕДИА =================
@@ -288,7 +303,6 @@ def ask_groq(user, user_text):
     web_context = gather_web_context(user_text)
     full_user_message = user_text + web_context if web_context else user_text
 
-    # В историю сохраняем компактно, а в текущий запрос передаём все найденные данные из интернета
     messages_for_api = list(chat_histories[uid]) + [{"role": "user", "content": full_user_message}]
 
     headers = {
@@ -462,10 +476,8 @@ def start_cmd(message):
     name = user.first_name or "друг"
     bot.send_message(
         message.chat.id,
-        f"Привет, {name}! Я обновлён до версии {BOT_VERSION}.\n"
-        f"Время в Москве: {get_moscow_time_str()}\n\n"
-        "Пиши любой вопрос — у меня есть доступ в интернет и поиск по YouTube, "
-        "а также я понимаю фото, стикеры, гифки и голосовые сообщения.",
+        f"Привет, {name}! Я готов к работе (версия {BOT_VERSION}).\n\n"
+        "Задавай любые вопросы, проси написать код или присылай фото, стикеры, гифки и голосовые!",
         reply_markup=get_keyboard()
     )
 
