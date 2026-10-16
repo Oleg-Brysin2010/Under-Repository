@@ -13,7 +13,7 @@ CONFIG_1_NAME = "🇳🇱 Нидерланды | как раньше"
 # 3. Включить второй конфиг с блокировкой рекламы (True — включён, False — выключен)
 ENABLE_ADBLOCK_CONFIG = True
 
-# 4. Название второго конфига (с блокировкой рекламы)
+# 4. Название второго конфига (с максимальной блокировкой рекламы)
 CONFIG_2_ADBLOCK_NAME = "🇳🇱 Нидерланды | Без рекламы 🛡️"
 
 # 5. Лимит трафика для полосы в гигабайтах (0 — скрыть полосу)
@@ -29,7 +29,7 @@ UPDATE_HOURS = 6
 SUPPORT_URL = ""
 WEB_PAGE_URL = ""
 
-# Если False — всегда берутся настройки из блока выше (чтобы settings.json их не перебивал)
+# Если False — всегда берутся настройки из блока выше
 USE_SETTINGS_JSON_FILE = False
 
 # =====================================================================
@@ -47,7 +47,6 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
-# ==================== СЕКРЕТЫ И СЕРВЕР (.env) ====================
 SUB_SECRET = os.environ.get("SUB_SECRET", "")
 SUB_HOST = os.environ.get("SUB_HOST", "0.0.0.0")
 SUB_PORT = int(os.environ.get("SUB_PORT", "8088"))
@@ -83,7 +82,6 @@ USAGE_LOCK = threading.Lock()
 
 
 def load_settings():
-    """Возвращает настройки из шапки файла (или из settings.json, если включён USE_SETTINGS_JSON_FILE)."""
     s = dict(DEFAULT_SETTINGS)
     if not USE_SETTINGS_JSON_FILE:
         return s
@@ -99,7 +97,6 @@ def load_settings():
     return s
 
 
-# ==================== ЛОГИРОВАНИЕ ====================
 def setup_logging():
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s: %(message)s", "%Y-%m-%d %H:%M:%S")
     root = logging.getLogger()
@@ -112,7 +109,6 @@ def setup_logging():
     root.addHandler(ch)
 
 
-# ==================== ДОМЕНЫ И ПРАВИЛА ====================
 RU_DIRECT_DOMAINS = [
     "geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai",
     "domain:sberbank.com", "domain:vtb.com", "domain:vk.com", "domain:vk.me",
@@ -127,16 +123,28 @@ BLOCKED_IN_RU_VIA_PROXY = [
     "domain:4pda.to", "domain:4pda.ru", "domain:rutracker.org", "domain:meduza.io",
 ]
 
-# База рекламных сетей и трекеров для второго конфига («Без рекламы»)
+# Усиленный список рекламных доменов (включая баннерные сети Google/YouTube и мобильную рекламу)
 AD_BLOCK_DOMAINS = [
     "geosite:category-ads-all",
+    "geosite:google-ads",
     "domain:doubleclick.net",
+    "domain:googleads.g.doubleclick.net",
+    "domain:static.doubleclick.net",
+    "domain:ad.doubleclick.net",
+    "domain:mediavisor.doubleclick.net",
     "domain:googlesyndication.com",
+    "domain:pagead2.googlesyndication.com",
+    "domain:tpc.googlesyndication.com",
     "domain:googleadservices.com",
+    "domain:adservice.google.com",
+    "domain:adservice.google.ru",
+    "domain:ads.youtube.com",
+    "domain:s.youtube.com",
+    "domain:youtube.cleverads.vn",
     "domain:google-analytics.com",
     "domain:googletagmanager.com",
-    "domain:adservice.google.com",
-    "domain:pagead2.googlesyndication.com",
+    "domain:app-measurement.com",
+    "domain:firebase-settings.crashlytics.com",
     "domain:an.yandex.ru",
     "domain:yandexadexchange.net",
     "domain:awaps.yandex.net",
@@ -145,6 +153,7 @@ AD_BLOCK_DOMAINS = [
     "domain:ad.mail.ru",
     "domain:r.mail.ru",
     "domain:unityads.unity3d.com",
+    "domain:ads.prd.ie.internal.unity3d.com",
     "domain:applovin.com",
     "domain:applvn.com",
     "domain:vungle.com",
@@ -161,11 +170,12 @@ AD_BLOCK_DOMAINS = [
     "domain:adriver.ru",
     "domain:betweendigital.com",
     "domain:buzzoola.com",
+    "domain:adjust.com",
+    "domain:appsflyer.com",
 ]
 
 
 def build_config(remarks, ru_direct):
-    """Базовый клиентский конфиг Xray."""
     if ru_direct:
         dns_servers = [
             {
@@ -272,25 +282,51 @@ def build_legacy_config(remarks):
 
 
 def build_adblock_config(remarks):
-    """Второй конфиг: Нидерланды + полная блокировка рекламы (AdGuard DNS + фильтр рекламных доменов)."""
+    """Второй конфиг: Усиленная блокировка рекламы (AdGuard DNS + перехват порта 53 + блок QUIC UDP 443)."""
     cfg = build_legacy_config(remarks)
-    # Подключаем DNS-серверы AdGuard, которые блокируют рекламу и баннеры на уровне DNS
+
+    # 1. Настраиваем AdGuard DNS со встроенной блокировкой рекламных хостов
     cfg["dns"] = {
+        "hosts": {
+            "domain:doubleclick.net": "127.0.0.1",
+            "domain:googlesyndication.com": "127.0.0.1",
+            "domain:googleadservices.com": "127.0.0.1",
+            "domain:adservice.google.com": "127.0.0.1",
+            "domain:ads.youtube.com": "127.0.0.1",
+            "domain:an.yandex.ru": "127.0.0.1",
+            "domain:ads.vk.com": "127.0.0.1",
+        },
         "servers": [
             "https://dns.adguard-dns.com/dns-query",
             "94.140.14.14",
             "94.140.15.15",
         ],
-        "queryStrategy": "IPIfNonMatch",
+        "queryStrategy": "UseIPv4",
     }
-    # Ставим правило блокировки рекламных сетей самым первым в списке маршрутизации
-    ad_rule = {"domain": AD_BLOCK_DOMAINS, "outboundTag": "block"}
-    cfg["routing"]["rules"] = [ad_rule] + cfg["routing"]["rules"]
+
+    # 2. Добавляем специальный выход dns-out, чтобы все DNS-запросы телефона шли строго через фильтр Xray
+    cfg["outbounds"].append({"tag": "dns-out", "protocol": "dns"})
+
+    # 3. Включаем глубокий sniffing (routeOnly=False), чтобы Xray проверял домены внутри трафика
+    cfg["inbounds"][0]["sniffing"] = {
+        "enabled": True,
+        "routeOnly": False,
+        "destOverride": ["http", "tls", "quic", "fakedns"],
+    }
+
+    # 4. Правила маршрутизации: перехват DNS (порт 53), блок рекламы, блок UDP 443 (QUIC)
+    cfg["routing"] = {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {"port": "53", "outboundTag": "dns-out"},
+            {"domain": AD_BLOCK_DOMAINS, "outboundTag": "block"},
+            {"network": "udp", "port": "443", "outboundTag": "block"},
+        ] + cfg["routing"]["rules"],
+    }
     return cfg
 
 
 def build_subscription(settings):
-    """Формирует список конфигов в подписке."""
     configs = [
         build_legacy_config(settings["config_name"]),
     ]
@@ -299,7 +335,6 @@ def build_subscription(settings):
     return configs
 
 
-# ==================== УЧЁТ ТРАФИКА ====================
 def read_tx_bytes():
     want = os.environ.get("IFACE", "")
     best = -1
@@ -360,7 +395,6 @@ def usage_thread():
         time.sleep(300)
 
 
-# ==================== HTTP ====================
 class Handler(BaseHTTPRequestHandler):
     server_version = "nginx"
     sys_version = ""
@@ -406,7 +440,6 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-# ==================== ТОЧКА ВХОДА ====================
 if __name__ == "__main__":
     setup_logging()
     missing = [
