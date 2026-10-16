@@ -1,12 +1,41 @@
-"""Сервер подписки для VPN (Xray, VLESS + Reality).
+"""Сервер подписки для VPN (Xray, VLESS + Reality)."""
 
-Отдаёт по секретной ссылке JSON-конфиг и заголовки, по которым приложение
-рисует название группы, полосу трафика и дату окончания.
+# =====================================================================
+# ⚙️ ГЛАВНЫЕ НАСТРОЙКИ ПОДПИСКИ (МЕНЯТЬ ЗДЕСЬ — В САМОМ ВЕРХУ)
+# =====================================================================
 
-Секреты (UUID, ключи) берутся из переменных окружения (.env на сервере).
-Названия, лимит, дата и т.п. берутся из settings.json и перечитываются
-при КАЖДОМ запросе подписки, поэтому перезапускать сервис не нужно.
-"""
+# 1. Название всей группы подписки (заголовок карточки в приложении)
+PROFILE_TITLE = "🚀 Мой VPN | Нидерланды 🚀"
+
+# 2. Название первого конфига (обычный, без фильтрации)
+CONFIG_1_NAME = "🇳🇱 Нидерланды | как раньше"
+
+# 3. Включить второй конфиг с блокировкой рекламы (True — включён, False — выключен)
+ENABLE_ADBLOCK_CONFIG = True
+
+# 4. Название второго конфига (с блокировкой рекламы)
+CONFIG_2_ADBLOCK_NAME = "🇳🇱 Нидерланды | Без рекламы 🛡️"
+
+# 5. Лимит трафика для полосы в гигабайтах (0 — скрыть полосу)
+TOTAL_GB = 1000
+
+# 6. Дата окончания подписки в формате Unix (4102444799 = 31.12.2099)
+EXPIRE_TS = 4102444799
+
+# 7. Как часто приложение само обновляет подписку (в часах)
+UPDATE_HOURS = 6
+
+# 8. Дополнительные ссылки (можно оставить пустыми)
+SUPPORT_URL = ""
+WEB_PAGE_URL = ""
+
+# Если False — всегда берутся настройки из блока выше (чтобы settings.json их не перебивал)
+USE_SETTINGS_JSON_FILE = False
+
+# =====================================================================
+# ДАЛЬШЕ ИДЁТ СИСТЕМНЫЙ КОД СЕРВЕРА (МЕНЯТЬ НЕ НУЖНО)
+# =====================================================================
+
 import base64
 import hmac
 import json
@@ -19,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
 # ==================== СЕКРЕТЫ И СЕРВЕР (.env) ====================
-SUB_SECRET = os.environ.get("SUB_SECRET", "")  # секретная часть ссылки
+SUB_SECRET = os.environ.get("SUB_SECRET", "")
 SUB_HOST = os.environ.get("SUB_HOST", "0.0.0.0")
 SUB_PORT = int(os.environ.get("SUB_PORT", "8088"))
 
@@ -30,23 +59,23 @@ REALITY_PUBLIC_KEY = os.environ.get("REALITY_PUBLIC_KEY", "")
 REALITY_SHORT_ID = os.environ.get("REALITY_SHORT_ID", "")
 REALITY_SNI = os.environ.get("REALITY_SNI", "dl.google.com")
 
-SSL_CERT = os.environ.get("SSL_CERT", "")  # по желанию: https
+SSL_CERT = os.environ.get("SSL_CERT", "")
 SSL_KEY = os.environ.get("SSL_KEY", "")
 
 USAGE_FILE = os.environ.get("USAGE_FILE", "usage.json")
 LOG_FILE = os.environ.get("LOG_FILE", "vpn_sub.log")
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
 
-# ==================== НАСТРОЙКИ ПО УМОЛЧАНИЮ ====================
-# Любое из этих значений можно переопределить в settings.json
 DEFAULT_SETTINGS = {
-    "profile_title": "🚀 Мой VPN | Нидерланды 🚀",  # название группы (верхняя строка)
-    "config_name": "🇳🇱 Нидерланды | как раньше",   # название конфига
-    "total_gb": 1000,                                # лимит для полосы; 0 — без полосы
-    "expire_ts": 4102444799,                         # дата окончания (unix), 31.12.2099
-    "update_hours": 6,                               # как часто приложение обновляет подписку
-    "support_url": "",
-    "web_page_url": "",
+    "profile_title": PROFILE_TITLE,
+    "config_name": CONFIG_1_NAME,
+    "adblock_config_name": CONFIG_2_ADBLOCK_NAME,
+    "enable_adblock": ENABLE_ADBLOCK_CONFIG,
+    "total_gb": TOTAL_GB,
+    "expire_ts": EXPIRE_TS,
+    "update_hours": UPDATE_HOURS,
+    "support_url": SUPPORT_URL,
+    "web_page_url": WEB_PAGE_URL,
 }
 
 log = logging.getLogger("vpn_sub")
@@ -54,8 +83,10 @@ USAGE_LOCK = threading.Lock()
 
 
 def load_settings():
-    """Читает settings.json при каждом запросе. Если файла нет или он битый — берёт значения по умолчанию."""
+    """Возвращает настройки из шапки файла (или из settings.json, если включён USE_SETTINGS_JSON_FILE)."""
     s = dict(DEFAULT_SETTINGS)
+    if not USE_SETTINGS_JSON_FILE:
+        return s
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -64,7 +95,7 @@ def load_settings():
     except FileNotFoundError:
         pass
     except Exception as e:
-        log.warning("Не удалось прочитать %s (%s), использую значения по умолчанию", SETTINGS_FILE, e)
+        log.warning("Не удалось прочитать %s (%s), использую значения из шапки кода", SETTINGS_FILE, e)
     return s
 
 
@@ -81,7 +112,7 @@ def setup_logging():
     root.addHandler(ch)
 
 
-# ==================== КОНФИГ ====================
+# ==================== ДОМЕНЫ И ПРАВИЛА ====================
 RU_DIRECT_DOMAINS = [
     "geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai",
     "domain:sberbank.com", "domain:vtb.com", "domain:vk.com", "domain:vk.me",
@@ -89,15 +120,52 @@ RU_DIRECT_DOMAINS = [
     "domain:2gis.com", "domain:ozonusercontent.com", "domain:wbstatic.net",
     "geosite:private", "geosite:apple", "geosite:apple-pki", "geosite:huawei", "geosite:xiaomi",
 ]
+
 BLOCKED_IN_RU_VIA_PROXY = [
     "domain:theins.ru", "domain:tvrain.ru", "domain:echo.msk.ru", "domain:novayagazeta.ru",
     "domain:moscowtimes.ru", "domain:the-village.ru", "domain:snob.ru", "domain:habr.com",
     "domain:4pda.to", "domain:4pda.ru", "domain:rutracker.org", "domain:meduza.io",
 ]
 
+# База рекламных сетей и трекеров для второго конфига («Без рекламы»)
+AD_BLOCK_DOMAINS = [
+    "geosite:category-ads-all",
+    "domain:doubleclick.net",
+    "domain:googlesyndication.com",
+    "domain:googleadservices.com",
+    "domain:google-analytics.com",
+    "domain:googletagmanager.com",
+    "domain:adservice.google.com",
+    "domain:pagead2.googlesyndication.com",
+    "domain:an.yandex.ru",
+    "domain:yandexadexchange.net",
+    "domain:awaps.yandex.net",
+    "domain:ads.vk.com",
+    "domain:target.my.com",
+    "domain:ad.mail.ru",
+    "domain:r.mail.ru",
+    "domain:unityads.unity3d.com",
+    "domain:applovin.com",
+    "domain:applvn.com",
+    "domain:vungle.com",
+    "domain:chartboost.com",
+    "domain:ironsrc.com",
+    "domain:inmobi.com",
+    "domain:tapjoy.com",
+    "domain:moatads.com",
+    "domain:criteo.com",
+    "domain:criteo.net",
+    "domain:outbrain.com",
+    "domain:taboola.com",
+    "domain:adfox.ru",
+    "domain:adriver.ru",
+    "domain:betweendigital.com",
+    "domain:buzzoola.com",
+]
+
 
 def build_config(remarks, ru_direct):
-    """Клиентский конфиг Xray. ru_direct=True: российские сайты напрямую, остальное через VPN."""
+    """Базовый клиентский конфиг Xray."""
     if ru_direct:
         dns_servers = [
             {
@@ -185,7 +253,7 @@ def build_config(remarks, ru_direct):
 
 
 def build_legacy_config(remarks):
-    """Старый, проверенный конфиг («как раньше»)."""
+    """Первый конфиг: проверенный («как раньше»)."""
     cfg = build_config(remarks, True)
     cfg["dns"] = {
         "servers": [
@@ -197,22 +265,42 @@ def build_legacy_config(remarks):
         ],
         "queryStrategy": "IPIfNonMatch",
     }
-    cfg["routing"]["rules"] = cfg["routing"]["rules"][:4]  # без блокировки UDP 443
+    cfg["routing"]["rules"] = cfg["routing"]["rules"][:4]
     cfg["inbounds"][0]["sniffing"] = {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"]}
     cfg["outbounds"][0]["streamSettings"]["realitySettings"]["fingerprint"] = "firefox"
     return cfg
 
 
+def build_adblock_config(remarks):
+    """Второй конфиг: Нидерланды + полная блокировка рекламы (AdGuard DNS + фильтр рекламных доменов)."""
+    cfg = build_legacy_config(remarks)
+    # Подключаем DNS-серверы AdGuard, которые блокируют рекламу и баннеры на уровне DNS
+    cfg["dns"] = {
+        "servers": [
+            "https://dns.adguard-dns.com/dns-query",
+            "94.140.14.14",
+            "94.140.15.15",
+        ],
+        "queryStrategy": "IPIfNonMatch",
+    }
+    # Ставим правило блокировки рекламных сетей самым первым в списке маршрутизации
+    ad_rule = {"domain": AD_BLOCK_DOMAINS, "outboundTag": "block"}
+    cfg["routing"]["rules"] = [ad_rule] + cfg["routing"]["rules"]
+    return cfg
+
+
 def build_subscription(settings):
-    # Один конфиг. Чтобы добавить ещё, допиши build_config(...) в этот список.
-    return [
+    """Формирует список конфигов в подписке."""
+    configs = [
         build_legacy_config(settings["config_name"]),
     ]
+    if settings.get("enable_adblock", True):
+        configs.append(build_adblock_config(settings["adblock_config_name"]))
+    return configs
 
 
-# ==================== УЧЁТ ТРАФИКА (приблизительный) ====================
+# ==================== УЧЁТ ТРАФИКА ====================
 def read_tx_bytes():
-    """Сколько байт сервер отправил через основной сетевой интерфейс с момента загрузки."""
     want = os.environ.get("IFACE", "")
     best = -1
     try:
@@ -238,7 +326,6 @@ def read_tx_bytes():
 
 
 def update_usage():
-    """Копит исходящий трафик за календарный месяц (UTC). Возвращает байты."""
     with USAGE_LOCK:
         month = time.strftime("%Y-%m", time.gmtime())
         cur = read_tx_bytes()
@@ -253,7 +340,7 @@ def update_usage():
             st = {"month": month, "last_tx": cur, "used": 0}
         else:
             last = int(st["last_tx"])
-            delta = cur - last if cur >= last else cur  # после перезагрузки счётчик начинается с нуля
+            delta = cur - last if cur >= last else cur
             st["used"] = int(st.get("used", 0)) + delta
             st["last_tx"] = cur
         try:
@@ -287,7 +374,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        s = load_settings()  # свежие настройки при каждом запросе
+        s = load_settings()
         body = json.dumps(build_subscription(s), ensure_ascii=False).encode("utf-8")
         used = update_usage()
         title = "base64:" + base64.b64encode(str(s["profile_title"]).encode("utf-8")).decode()
@@ -315,7 +402,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self._serve(head_only=True)
 
-    def log_message(self, fmt, *args):  # свои логи выше, без секретной ссылки
+    def log_message(self, fmt, *args):
         pass
 
 
