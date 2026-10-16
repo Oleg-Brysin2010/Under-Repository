@@ -20,8 +20,13 @@ except ImportError:
 TELEGRAM_TOKEN = "8967141379:" + "AAFIy52g-Rz0ff73dFQaTn1t7PZ0xlU7Qjs"
 GROQ_API_KEY = "gsk_" + "7ZZ7rgRfeBzOIEnchdcyWGdyb3FYPeTrVNq4oew7RXzxiVfAmn20"
 
-BOT_VERSION = "4.1"
+BOT_VERSION = "5.0"
 OLD_MEMORY_FILE = "/root/ai-bot/memory.json"
+HISTORY_FILE = "/root/ai-bot/chat_history.json"
+
+# Максимальный размер истории, которую бот перечитывает целиком (до 80 сообщений подряд)
+MAX_HISTORY_MESSAGES = 80
+MAX_HISTORY_CHARS = 60000
 
 if os.path.exists(OLD_MEMORY_FILE):
     try:
@@ -31,8 +36,6 @@ if os.path.exists(OLD_MEMORY_FILE):
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-chat_histories = {}
-
 MAIN_MODELS = [
     "openai/gpt-oss-120b",
     "llama-3.3-70b-versatile",
@@ -41,9 +44,9 @@ MAIN_MODELS = [
 ]
 
 ROUTER_MODELS = [
-    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
     "openai/gpt-oss-20b",
-    "llama-3.3-70b-versatile"
+    "llama-3.1-8b-instant"
 ]
 
 VISION_MODELS = [
@@ -51,6 +54,29 @@ VISION_MODELS = [
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "meta-llama/llama-4-maverick-17b-128e-instruct"
 ]
+
+# ================= СОХРАНЕНИЕ И ПЕРЕЧИТЫВАНИЕ ВСЕГО ЧАТА =================
+
+def load_histories():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+def save_histories():
+    try:
+        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(chat_histories, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Ошибка сохранения истории: {e}")
+
+chat_histories = load_histories()
 
 def get_keyboard():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -60,22 +86,40 @@ def get_keyboard():
 def build_system_prompt(user):
     name = (user.first_name or "друг").strip()
     return (
-        f"Ты умный, современный ИИ-помощник в Telegram.\n"
-        f"Сейчас разговариваешь с пользователем по имени: {name}.\n\n"
-        f"СТРОГИЕ ПРАВИЛА:\n"
-        f"1. НИКОГДА не пиши про серверы, Нидерланды, хостинг или GitHub.\n"
-        f"2. НИКОГДА не используй в тексте символы разметки: НЕ пиши решётки (#, ##, ###), "
-        f"НЕ пиши звёздочки (*, **), НЕ рисуй таблицы из вертикальных палок и тире (|---|---|), "
-        f"НЕ ставь знаки цитат (>) в начале строки. Пиши только чистым, красивым обычным текстом с абзацами. "
-        f"Для списков используй обычное тире (-) или цифры (1., 2.).\n"
-        f"3. НЕ присылай ссылки на сайты или YouTube, если пользователь сам не просил ссылку, видео или информацию про конкретный канал. "
-        f"На обычное общение, благодарность или похвалу отвечай просто и по-человечески.\n"
-        f"4. Если в запросе переданы ДАННЫЕ ИЗ ИНТЕРНЕТА — используй их для точного ответа, но бери оттуда только то, что реально относится к вопросу пользователя.\n"
-        f"5. Если пользователь просит написать программный код — пиши полный, чистый рабочий код."
+        f"Ты сверхточный, глубоко мыслящий и умный ИИ-ассистент (уровня Claude 3.7 / GPT-4o).\n\n"
+        f"ГЛАВНЫЕ ПРАВИЛА ПОВЕДЕНИЯ:\n"
+        f"1. ПАМЯТЬ КАК У CLAUDE: Перед тем как написать ответ, внимательно перечитай ВСЮ историю переписки выше от самого первого до последнего сообщения. "
+        f"Помни все детали, предыдущие вопросы, код и контекст разговора. Никогда не теряй нить беседы.\n"
+        f"2. ЗАПРЕТ НА ПОВТОР ИМЕНИ: КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО обращаться к пользователю по имени («{name}») в обычных сообщениях! "
+        f"Не пиши имя ни в начале, ни в конце фраз. Назови имя «{name}» ТОЛЬКО в том случае, если пользователь сам прямо спросит: «Как меня зовут?» или «Кто я?».\n"
+        f"3. НИКАКОЙ ЛИШНЕЙ ИНФОРМАЦИИ: Никогда не упоминай серверы, Нидерланды, хостинг или GitHub.\n"
+        f"4. ЧИСТЫЙ ТЕКСТ БЕЗ СИМВОЛОВ РАЗМЕТКИ: Никогда не используй решётки (#, ##, ###), звёздочки (*, **), таблицы из палок (|---|---|) или знаки цитат (>). "
+        f"Пиши чистым, понятным и хорошо структурированным текстом с абзацами. Для списков используй обычное тире (-) или цифры (1., 2.).\n"
+        f"5. УМНАЯ РАБОТА С ИНТЕРНЕТОМ: Если к сообщению приложены данные из интернета — глубоко проанализируй их и дай точный, умный ответ. "
+        f"Ссылки на сайты и YouTube давай ТОЛЬКО тогда, когда пользователь сам попросил ссылку/видео или спрашивал про канал.\n"
+        f"6. НАПИСАНИЕ КОДА: Когда просят написать или исправить код — пиши максимально качественный, полный и рабочий код без сокращений."
     )
 
+def trim_history_ safely(history_list):
+    """Оставляет системный промпт и максимум сообщений диалога, чтобы бот помнил весь чат."""
+    if not history_list:
+        return history_list
+    sys_msg = history_list[0]
+    dialog = history_list[1:]
+
+    if len(dialog) > MAX_HISTORY_MESSAGES:
+        dialog = dialog[-MAX_HISTORY_MESSAGES:]
+
+    # Контроль по общему числу символов, чтобы не превысить лимит окна модели
+    total_chars = sum(len(m.get("content", "")) for m in dialog)
+    while len(dialog) > 6 and total_chars > MAX_HISTORY_CHARS:
+        removed = dialog.pop(0)
+        total_chars -= len(removed.get("content", ""))
+
+    return [sys_msg] + dialog
+
 def clean_formatting(text):
-    """Удаляет таблицы |---|, решётки ### и звёздочки **, сохраняя блоки кода."""
+    """Очищает ответ от символов #, *, таблиц |---| и тегов размышлений <think>."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
     parts = re.split(r"(```[\s\S]*?```)", text)
@@ -119,31 +163,46 @@ def clean_formatting(text):
 
     return "\n".join(cleaned_parts).strip()
 
-# ================= УМНЫЙ ПОИСК В ИНТЕРНЕТЕ И YOUTUBE =================
+# ================= КОНТЕКСТНЫЙ УМНЫЙ ПОИСК В ИНТЕРНЕТЕ =================
 
-def decide_search_need(user_text):
-    """Определяет через быструю модель, нужен ли вообще поиск в интернете или на YouTube для этого сообщения."""
+def decide_search_need(uid, user_text):
+    """Анализирует текущее сообщение ВМЕСТЕ с историей чата, чтобы понимать уточняющие вопросы."""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
+
+    # Берем последние 6 сообщений из чата для понимания контекста (например, о ком шла речь)
+    recent_context = ""
+    if uid in chat_histories and len(chat_histories[uid]) > 1:
+        recent_msgs = chat_histories[uid][-6:]
+        ctx_lines = []
+        for m in recent_msgs:
+            role_label = "Пользователь" if m["role"] == "user" else "ИИ"
+            ctx_lines.append(f"{role_label}: {m['content'][:300]}")
+        recent_context = "\n".join(ctx_lines)
+
     router_prompt = (
-        "Определи, требует ли сообщение пользователя поиска информации в интернете или поиска видео на YouTube.\n"
+        "Ты анализатор запросов. Прочитай недавний контекст чата и новое сообщение пользователя.\n"
+        "Определи, нужен ли поиск в интернете (web) или на YouTube (youtube).\n"
         "Правила:\n"
-        "- Если это обычное общение, приветствие, благодарность, похвала (например: 'спасибо большое ты умничка', 'красава', 'привет как дела'), "
-        "просьба написать код, решить задачу или перевести текст -> web: false, youtube: false.\n"
-        "- Если пользователь спрашивает про конкретного человека, блогера, стримера (например Т2х2), игру, компанию, новости, погоду, текущее время, курс или факт -> web: true.\n"
-        "- Если пользователь явно просит скинуть видео, ссылку на ролик/канал или спрашивает про ютубера/YouTube-канал -> youtube: true.\n"
-        "Ответь СТРОГО в формате JSON без лишнего текста:\n"
-        '{"web": false, "youtube": false, "query": "точный поисковый запрос"}'
+        "1. Если это обычное общение, похвала, благодарность, шутка, просьба написать код, решить задачу или вопрос по уже написанному в чате тексту -> web: false, youtube: false.\n"
+        "2. Если спрашивают про реального человека, стримера, блогера, игру, событие, новости, факты, время или погоду -> web: true.\n"
+        "3. Если просят скинуть видео, ссылку на канал/ролик или спрашивают про ютубера -> youtube: true.\n"
+        "4. ВАЖНО: Если пользователь задаёт короткий уточняющий вопрос (например: 'а сколько ему лет?', 'скинь его канал'), "
+        "посмотри в контекст чата, о ком шла речь, и составь полный точный поисковый запрос в поле query!\n"
+        "Ответь СТРОГО в формате JSON:\n"
+        '{"web": false, "youtube": false, "query": "полный поисковый запрос"}'
     )
+
+    user_payload = f"Контекст чата:\n{recent_context}\n\nНовое сообщение пользователя: {user_text}" if recent_context else user_text
 
     for r_model in ROUTER_MODELS:
         payload = {
             "model": r_model,
             "messages": [
                 {"role": "system", "content": router_prompt},
-                {"role": "user", "content": user_text}
+                {"role": "user", "content": user_payload}
             ],
             "temperature": 0.0
         }
@@ -169,7 +228,7 @@ def decide_search_need(user_text):
 
     return False, False, user_text
 
-def search_duckduckgo(query, max_results=5):
+def search_duckduckgo(query, max_results=6):
     results = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -200,9 +259,10 @@ def search_duckduckgo(query, max_results=5):
         pass
     return results
 
-def search_wikipedia_ru(query):
+def search_wikipedia_deep(query):
+    """Загружает не просто строчку, а полную сводку статьи из Википедии для глубоких знаний."""
     results = []
-    headers = {"User-Agent": "TelegramAIBot/4.1"}
+    headers = {"User-Agent": "TelegramAIBot/5.0"}
     try:
         params = {
             "action": "query",
@@ -217,9 +277,25 @@ def search_wikipedia_ru(query):
             search_items = r.json().get("query", {}).get("search", [])
             for item in search_items:
                 title = item.get("title", "")
-                snip = re.sub(r"<.*?>", "", item.get("snippet", "")).strip()
                 page_url = f"https://ru.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
-                results.append(f"- Википедия ({title}): {snip} (Ссылка: {page_url})")
+                # Запрашиваем полный вступительный текст статьи
+                ext_params = {
+                    "action": "query",
+                    "prop": "extracts",
+                    "exintro": 1,
+                    "explaintext": 1,
+                    "titles": title,
+                    "format": "json"
+                }
+                er = requests.get("https://ru.wikipedia.org/w/api.php", params=ext_params, headers=headers, timeout=6)
+                extract_text = ""
+                if er.status_code == 200:
+                    pages = er.json().get("query", {}).get("pages", {})
+                    for _, pdata in pages.items():
+                        extract_text = pdata.get("extract", "").strip()
+                if not extract_text:
+                    extract_text = re.sub(r"<.*?>", "", item.get("snippet", "")).strip()
+                results.append(f"- Статья Википедии «{title}»: {extract_text[:1500]} (Ссылка: {page_url})")
     except Exception:
         pass
     return results
@@ -261,19 +337,19 @@ def search_youtube(query, max_results=3):
         pass
     return results
 
-def gather_web_context(user_text):
-    need_web, need_yt, search_query = decide_search_need(user_text)
+def gather_web_context(uid, user_text):
+    need_web, need_yt, search_query = decide_search_need(uid, user_text)
     if not need_web and not need_yt:
         return ""
 
     blocks = []
     if need_web:
-        web_res = search_duckduckgo(search_query, max_results=5)
-        wiki_res = search_wikipedia_ru(search_query)
-        if web_res:
-            blocks.append("Результаты из интернета:\n" + "\n".join(web_res))
+        web_res = search_duckduckgo(search_query, max_results=6)
+        wiki_res = search_wikipedia_deep(search_query)
         if wiki_res:
-            blocks.append("Результаты из Википедии:\n" + "\n".join(wiki_res))
+            blocks.append("Подробные данные из Википедии:\n" + "\n".join(wiki_res))
+        if web_res:
+            blocks.append("Результаты поиска из интернета:\n" + "\n".join(web_res))
 
     if need_yt:
         yt_res = search_youtube(search_query, max_results=3)
@@ -284,26 +360,32 @@ def gather_web_context(user_text):
         return ""
 
     return (
-        "\n\n[СПРАВОЧНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА ПО ВОПРОСУ ПОЛЬЗОВАТЕЛЯ]\n"
+        f"\n\n[ДАННЫЕ ИЗ ИНТЕРНЕТА ПО ЗАПРОСУ «{search_query}»]\n"
         + "\n\n".join(blocks)
-        + "\n[КОНЕЦ СПРАВОЧНЫХ ДАННЫХ. Ответь на вопрос пользователя. Ссылки давай ТОЛЬКО если пользователь сам их попросил или спрашивал про канал/видео!]"
+        + "\n[КОНЕЦ ДАННЫХ ИЗ ИНТЕРНЕТА. Проанализируй эту информацию вместе со всей историей чата и дай точный ответ. Ссылки вставляй ТОЛЬКО если пользователь их просил!]"
     )
 
-# ================= РАБОТА С ИИ И МЕДИА =================
+# ================= ОСНОВНАЯ ЛОГИКА ИИ И ЗРЕНИЯ =================
 
-def ask_groq(user, user_text):
+def ensure_user_history(user):
     uid = str(user.id)
     sys_prompt = build_system_prompt(user)
-
     if uid not in chat_histories or not chat_histories[uid]:
         chat_histories[uid] = [{"role": "system", "content": sys_prompt}]
     else:
         chat_histories[uid][0] = {"role": "system", "content": sys_prompt}
+    chat_histories[uid] = trim_history_safely(chat_histories[uid])
+    return chat_histories[uid]
 
-    web_context = gather_web_context(user_text)
+def ask_groq(user, user_text):
+    uid = str(user.id)
+    history = ensure_user_history(user)
+
+    web_context = gather_web_context(uid, user_text)
     full_user_message = user_text + web_context if web_context else user_text
 
-    messages_for_api = list(chat_histories[uid]) + [{"role": "user", "content": full_user_message}]
+    # Передаём ВСЮ историю чата, чтобы бот перечитывал весь диалог перед ответом, как Claude
+    messages_for_api = list(history) + [{"role": "user", "content": full_user_message}]
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -315,23 +397,23 @@ def ask_groq(user, user_text):
         payload = {
             "model": model_name,
             "messages": messages_for_api,
-            "temperature": 0.5
+            "temperature": 0.4
         }
         try:
             response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=60
+                timeout=90
             )
             if response.status_code == 200:
                 raw_answer = response.json()["choices"][0]["message"]["content"]
                 clean_answer = clean_formatting(raw_answer)
 
-                chat_histories[uid].append({"role": "user", "content": user_text})
-                chat_histories[uid].append({"role": "assistant", "content": clean_answer})
-                if len(chat_histories[uid]) > 15:
-                    chat_histories[uid] = [chat_histories[uid][0]] + chat_histories[uid][-14:]
+                history.append({"role": "user", "content": user_text})
+                history.append({"role": "assistant", "content": clean_answer})
+                chat_histories[uid] = trim_history_safely(history)
+                save_histories()
 
                 return clean_answer
             else:
@@ -386,9 +468,20 @@ def convert_media_to_jpeg(raw_bytes, filename="file.bin"):
     return raw_bytes
 
 def ask_groq_vision(user, prompt_text, raw_bytes, file_path="image.jpg", history_note="изображение"):
+    uid = str(user.id)
+    history = ensure_user_history(user)
     jpeg_bytes = convert_media_to_jpeg(raw_bytes, file_path)
     b64_image = base64.b64encode(jpeg_bytes).decode("utf-8")
     sys_prompt = build_system_prompt(user)
+
+    # Передаём контекст последних сообщений чата в модель зрения, чтобы она понимала тему разговора
+    recent_chat_text = ""
+    if len(history) > 1:
+        recent_lines = []
+        for m in history[-8:]:
+            r_name = "Пользователь" if m["role"] == "user" else "ИИ"
+            recent_lines.append(f"{r_name}: {m['content'][:300]}")
+        recent_chat_text = "\nПредыдущий контекст вашего диалога:\n" + "\n".join(recent_lines) + "\n"
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -405,9 +498,9 @@ def ask_groq_vision(user, prompt_text, raw_bytes, file_path="image.jpg", history
                         {
                             "type": "text",
                             "text": (
-                                f"{sys_prompt}\n\n"
+                                f"{sys_prompt}\n{recent_chat_text}\n"
                                 f"Пользователь прислал {history_note}. "
-                                f"Внимательно разгляди картинку и ответь простым чистым текстом без звёздочек и решёток: {prompt_text}"
+                                f"Внимательно разгляди картинку и ответь чистым текстом без звёздочек, решёток и без обращения по имени: {prompt_text}"
                             )
                         },
                         {
@@ -417,7 +510,7 @@ def ask_groq_vision(user, prompt_text, raw_bytes, file_path="image.jpg", history
                     ]
                 }
             ],
-            "temperature": 0.6
+            "temperature": 0.5
         }
         try:
             resp = requests.post(
@@ -428,11 +521,10 @@ def ask_groq_vision(user, prompt_text, raw_bytes, file_path="image.jpg", history
             )
             if resp.status_code == 200:
                 answer = clean_formatting(resp.json()["choices"][0]["message"]["content"])
-                uid = str(user.id)
-                if uid not in chat_histories:
-                    chat_histories[uid] = [{"role": "system", "content": sys_prompt}]
-                chat_histories[uid].append({"role": "user", "content": f"[Пользователь прислал {history_note}]"})
-                chat_histories[uid].append({"role": "assistant", "content": answer})
+                history.append({"role": "user", "content": f"[Пользователь отправил {history_note}: {prompt_text}]"})
+                history.append({"role": "assistant", "content": answer})
+                chat_histories[uid] = trim_history_safely(history)
+                save_histories()
                 return answer
         except Exception:
             continue
@@ -471,13 +563,14 @@ def send_long_message(chat_id, text, reply_markup=None):
 @bot.message_handler(commands=["start"])
 def start_cmd(message):
     user = message.from_user
-    uid = str(user.id)
-    chat_histories[uid] = [{"role": "system", "content": build_system_prompt(user)}]
-    name = user.first_name or "друг"
+    ensure_user_history(user)
+    save_histories()
     bot.send_message(
         message.chat.id,
-        f"Привет, {name}! Я готов к работе (версия {BOT_VERSION}).\n\n"
-        "Задавай любые вопросы, проси написать код или присылай фото, стикеры, гифки и голосовые!",
+        f"Готов к работе (версия {BOT_VERSION}).\n\n"
+        "Я помню весь наш диалог целиком (как Claude), умею искать информацию в интернете и на YouTube, "
+        "понимаю фото, стикеры, гифки и голосовые сообщения.\n"
+        "Чтобы начать разговор с чистого листа — нажми «🗑 Очистить память».",
         reply_markup=get_keyboard()
     )
 
@@ -487,9 +580,10 @@ def clear_cmd(message):
     user = message.from_user
     uid = str(user.id)
     chat_histories[uid] = [{"role": "system", "content": build_system_prompt(user)}]
+    save_histories()
     bot.send_message(
         message.chat.id,
-        "Память диалога очищена! О чём поговорим?",
+        "Память диалога полностью очищена! Начинаем с чистого листа.",
         reply_markup=get_keyboard()
     )
 
@@ -499,7 +593,7 @@ def handle_photo(message):
         bot.send_chat_action(message.chat.id, "typing")
         file_id = message.photo[-1].file_id
         img_bytes, file_path = download_telegram_file(file_id)
-        caption = message.caption or "Опиши, что ты видишь на этом фото, и ответь мне."
+        caption = message.caption or "Опиши, что на этом фото, и ответь с учётом нашего разговора."
         reply = ask_groq_vision(message.from_user, caption, img_bytes, file_path, "фотографию")
         send_long_message(message.chat.id, reply, reply_markup=get_keyboard())
     except Exception as e:
@@ -511,7 +605,7 @@ def handle_sticker(message):
         bot.send_chat_action(message.chat.id, "typing")
         st = message.sticker
         emoji = st.emoji or "🙂"
-        prompt = "Посмотри на изображение этого стикера, скажи кто или что на нём и отреагируй в тему диалога."
+        prompt = "Посмотри на изображение этого стикера, пойми его эмоцию и отреагируй в тему нашего диалога."
         thumb = getattr(st, "thumbnail", None) or getattr(st, "thumb", None)
         if not st.is_animated:
             raw_bytes, file_path = download_telegram_file(st.file_id)
@@ -534,7 +628,7 @@ def handle_animation(message):
         bot.send_chat_action(message.chat.id, "typing")
         anim = message.animation
         caption = message.caption or ""
-        prompt = f"Посмотри на кадр из этой гифки и отреагируй в тему разговора. {caption}"
+        prompt = f"Посмотри на кадр из этой гифки и отреагируй в тему нашего разговора. {caption}"
         thumb = getattr(anim, "thumbnail", None) or getattr(anim, "thumb", None)
         if thumb:
             raw_bytes, file_path = download_telegram_file(thumb.file_id)
